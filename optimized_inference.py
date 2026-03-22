@@ -5,28 +5,22 @@ optimized_inference.py
 ======================
 Qwen2.5-14B-Instruct 批量优化推理引擎
 
-核心优化:
-  1. Batch并行生成 — 所有prompt一次性打batch推理
-  2. Triton融合RMSNorm / SiLU×gate算子
+优化:
+  1. Batch 并行生成 — 所有 prompt 打 batch 一次推理
+  2. Triton 融合 RMSNorm / SiLU×gate 算子
   3. Flash Attention (SDPA)
-  4. KV-Cache批量生成循环
-  5. 按长度排序分组 — 减少padding浪费
+  4. KV-Cache 批量贪心解码
+  5. 按长度排序分组 — 减少 padding 浪费
 """
 
+import os
+import sys
 import time
 import math
+import subprocess
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-try:
-    import triton
-    import triton.language as tl
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
-    print("[WARN] Triton 未安装，回退到 PyTorch 原生实现")
-
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ============================================================================
@@ -35,7 +29,7 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 DEVICE         = "cuda:0"
 DTYPE          = torch.float16
 MAX_NEW_TOKENS = 256
-BATCH_SIZE     = 32          # 默认batch大小，可根据显存调整
+BATCH_SIZE     = 32
 SEED           = 42
 
 torch.manual_seed(SEED)
@@ -46,11 +40,93 @@ if torch.cuda.is_available():
 
 
 # ============================================================================
+# 自动修复 Triton 编译环境
+# ============================================================================
+
+def _fix_triton_env():
+    """
+    Triton 编译 cuda_utils.c 时需要 Python.h。
+    自动把 Python include 路径加到 C_INCLUDE_PATH / CPATH。
+    """
+    import sysconfig
+    inc = sysconfig.get_path("include")
+    if inc and os.path.isfile(os.path.join(inc, "Python.h")):
+        # 把路径加入环境变量，让 gcc 能找到 Python.h
+        for var in ("CPATH", "C_INCLUDE_PATH"):
+            old = os.environ.get(var, "")
+            if inc not in old:
+                os.environ[var] = f"{inc}:{old}" if old else inc
+        return True
+    return False
+
+
+def _try_install_python_dev():
+    """尝试 apt 安装 python3-dev（需要 root）"""
+    try:
+        subprocess.check_call(
+            ["apt-get", "install", "-y", "python3-dev"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=60,
+        )
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================================
+# Triton 导入 + 运行时探测
+# ============================================================================
+
+_TRITON_IMPORTED = False
+HAS_TRITON       = False
+
+try:
+    # 先修复环境
+    if not _fix_triton_env():
+        _try_install_python_dev()
+        _fix_triton_env()
+
+    import triton
+    import triton.language as tl
+    _TRITON_IMPORTED = True
+except ImportError:
+    pass
+
+
+def _probe_triton():
+    """运行时探测 Triton 是否真正能编译 + 执行内核"""
+    global HAS_TRITON
+    if not _TRITON_IMPORTED:
+        print("[INFO] Triton 未安装，使用 PyTorch 原生优化")
+        HAS_TRITON = False
+        return
+
+    try:
+        @triton.jit
+        def _test_kernel(X, BLOCK: tl.constexpr):
+            idx = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+            tl.store(X + idx, tl.load(X + idx) + 1.0)
+
+        x = torch.zeros(128, device=DEVICE, dtype=torch.float32)
+        _test_kernel[(1,)](x, BLOCK=128)
+        torch.cuda.synchronize(DEVICE)
+        if x.sum().item() == 128.0:
+            HAS_TRITON = True
+            print(f"[INFO] Triton {triton.__version__} 探测成功，启用融合算子")
+        else:
+            raise RuntimeError("Triton 探测结果不正确")
+    except Exception as e:
+        HAS_TRITON = False
+        print(f"[WARN] Triton 运行时不可用: {e}")
+        print("[INFO] 回退到 PyTorch 原生融合实现")
+
+
+# ============================================================================
 # Triton 融合算子
 # ============================================================================
 
-if HAS_TRITON:
-    # ---- Triton 融合 RMSNorm ----
+if _TRITON_IMPORTED:
+    # ─── Triton 融合 RMSNorm ───
     @triton.jit
     def _rms_norm_kernel(
         X, W, Y,
@@ -59,33 +135,37 @@ if HAS_TRITON:
         BLOCK: tl.constexpr,
     ):
         row = tl.program_id(0)
-        x_ptr = X + row * stride_x
-        y_ptr = Y + row * stride_y
+        x_off = X + row * stride_x
+        y_off = Y + row * stride_y
         _acc = tl.zeros([BLOCK], dtype=tl.float32)
-        for off in range(0, N, BLOCK):
-            cols = off + tl.arange(0, BLOCK)
+        for b in range(0, N, BLOCK):
+            cols = b + tl.arange(0, BLOCK)
             mask = cols < N
-            x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-            _acc += x * x
+            xv = tl.load(x_off + cols, mask=mask, other=0.0).to(tl.float32)
+            _acc += xv * xv
         var = tl.sum(_acc, axis=0) / N
         rstd = 1.0 / tl.sqrt(var + eps)
-        for off in range(0, N, BLOCK):
-            cols = off + tl.arange(0, BLOCK)
+        for b in range(0, N, BLOCK):
+            cols = b + tl.arange(0, BLOCK)
             mask = cols < N
-            x = tl.load(x_ptr + cols, mask=mask, other=0.0).to(tl.float32)
-            w = tl.load(W + cols, mask=mask, other=1.0).to(tl.float32)
-            tl.store(y_ptr + cols, x * rstd * w, mask=mask)
+            xv = tl.load(x_off + cols, mask=mask, other=0.0).to(tl.float32)
+            wv = tl.load(W + cols, mask=mask, other=1.0).to(tl.float32)
+            tl.store(y_off + cols, xv * rstd * wv, mask=mask)
 
-    def triton_rms_norm(x, weight, eps=1e-6):
+    def _triton_rms_norm(x, weight, eps=1e-6):
         shape = x.shape
-        x2 = x.reshape(-1, shape[-1])
+        x2 = x.reshape(-1, shape[-1]).contiguous()
         M, N = x2.shape
         y = torch.empty_like(x2)
         BLK = min(triton.next_power_of_2(N), 4096)
-        _rms_norm_kernel[(M,)](x2, weight, y, x2.stride(0), y.stride(0), N, eps, BLOCK=BLK)
+        _rms_norm_kernel[(M,)](
+            x2, weight, y,
+            x2.stride(0), y.stride(0),
+            N, eps, BLOCK=BLK,
+        )
         return y.reshape(shape)
 
-    # ---- Triton 融合 SiLU × gate (SwiGLU) ----
+    # ─── Triton 融合 SiLU × gate (SwiGLU) ───
     @triton.jit
     def _silu_mul_kernel(
         G, U, O,
@@ -94,64 +174,93 @@ if HAS_TRITON:
         BLOCK: tl.constexpr,
     ):
         row = tl.program_id(0)
-        for off in range(0, N, BLOCK):
-            cols = off + tl.arange(0, BLOCK)
+        g_off = G + row * stride_g
+        u_off = U + row * stride_u
+        o_off = O + row * stride_o
+        for b in range(0, N, BLOCK):
+            cols = b + tl.arange(0, BLOCK)
             mask = cols < N
-            g = tl.load(G + row * stride_g + cols, mask=mask, other=0.0).to(tl.float32)
-            u = tl.load(U + row * stride_u + cols, mask=mask, other=0.0).to(tl.float32)
-            tl.store(O + row * stride_o + cols, g * tl.sigmoid(g) * u, mask=mask)
+            gv = tl.load(g_off + cols, mask=mask, other=0.0).to(tl.float32)
+            uv = tl.load(u_off + cols, mask=mask, other=0.0).to(tl.float32)
+            sv = gv * tl.sigmoid(gv) * uv
+            tl.store(o_off + cols, sv, mask=mask)
 
-    def triton_silu_mul(gate, up):
+    def _triton_silu_mul(gate, up):
         shape = gate.shape
-        g2 = gate.reshape(-1, shape[-1])
-        u2 = up.reshape(-1, shape[-1])
+        g2 = gate.reshape(-1, shape[-1]).contiguous()
+        u2 = up.reshape(-1, shape[-1]).contiguous()
         M, N = g2.shape
         o = torch.empty_like(g2)
         BLK = min(triton.next_power_of_2(N), 4096)
-        _silu_mul_kernel[(M,)](g2, u2, o, g2.stride(0), u2.stride(0), o.stride(0), N, BLOCK=BLK)
+        _silu_mul_kernel[(M,)](
+            g2, u2, o,
+            g2.stride(0), u2.stride(0), o.stride(0),
+            N, BLOCK=BLK,
+        )
         return o.reshape(shape)
 
 
-# ---- 统一入口（自动回退） ----
+# ============================================================================
+# PyTorch 原生实现（回退）
+# ============================================================================
+
+def _pt_rms_norm(x, weight, eps=1e-6):
+    xf = x.to(torch.float32)
+    var = xf.pow(2).mean(-1, keepdim=True)
+    return (xf * torch.rsqrt(var + eps) * weight.to(torch.float32)).to(x.dtype)
+
+
+def _pt_silu_mul(gate, up):
+    return F.silu(gate) * up
+
+
+# ============================================================================
+# 统一调度
+# ============================================================================
+
 def fused_rms_norm(x, w, eps=1e-6):
     if HAS_TRITON and x.is_cuda:
-        return triton_rms_norm(x, w, eps)
-    v = x.to(torch.float32).pow(2).mean(-1, keepdim=True)
-    return (x * torch.rsqrt(v + eps) * w).to(x.dtype)
+        return _triton_rms_norm(x, w, eps)
+    return _pt_rms_norm(x, w, eps)
+
 
 def fused_silu_mul(gate, up):
     if HAS_TRITON and gate.is_cuda:
-        return triton_silu_mul(gate, up)
-    return F.silu(gate) * up
+        return _triton_silu_mul(gate, up)
+    return _pt_silu_mul(gate, up)
 
 
 # ============================================================================
 # Monkey-patch 模型层
 # ============================================================================
 
-def _patch_rmsnorm(mod):
-    w, eps = mod.weight, getattr(mod, "variance_epsilon", getattr(mod, "eps", 1e-6))
+def _make_rmsnorm_fwd(mod):
+    w = mod.weight
+    eps = getattr(mod, "variance_epsilon", getattr(mod, "eps", 1e-6))
     def fwd(x):
         return fused_rms_norm(x, w, eps)
     return fwd
 
-def _patch_mlp(mod):
+
+def _make_mlp_fwd(mod):
     gp, up, dp = mod.gate_proj, mod.up_proj, mod.down_proj
     def fwd(x):
         return dp(fused_silu_mul(gp(x), up(x)))
     return fwd
 
-def apply_triton_optimizations(model):
+
+def apply_optimizations(model):
     n_rms = n_mlp = 0
     for _, m in model.named_modules():
         cn = type(m).__name__
         if "RMSNorm" in cn:
-            m.forward = _patch_rmsnorm(m)
+            m.forward = _make_rmsnorm_fwd(m)
             n_rms += 1
         if "MLP" in cn and hasattr(m, "gate_proj"):
-            m.forward = _patch_mlp(m)
+            m.forward = _make_mlp_fwd(m)
             n_mlp += 1
-    print(f"[OPT] Triton RMSNorm×{n_rms}, SwiGLU×{n_mlp}")
+    tag = "Triton" if HAS_TRITON else "PyTorch"
+    print(f"[OPT] {tag} 融合 RMSNorm×{n_rms}, SwiGLU×{n_mlp}")
 
 
 # ============================================================================
@@ -159,15 +268,16 @@ def apply_triton_optimizations(model):
 # ============================================================================
 
 def load_model(model_path: str):
-    """加载模型 + tokenizer + 全部优化，返回 (tokenizer, model)"""
     print(f"[INFO] 加载模型: {model_path}")
+    print(f"[INFO] 设备={DEVICE}  精度={DTYPE}")
+
     tokenizer = AutoTokenizer.from_pretrained(
         model_path, trust_remote_code=True, padding_side="left",
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 尝试 flash_attention_2 > sdpa > eager
+    # 尝试各种 attention 实现
     model = None
     for attn in ["flash_attention_2", "sdpa", "eager"]:
         try:
@@ -184,23 +294,29 @@ def load_model(model_path: str):
             continue
     if model is None:
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=DTYPE, device_map=DEVICE, trust_remote_code=True,
+            model_path, torch_dtype=DTYPE, device_map=DEVICE,
+            trust_remote_code=True,
         )
+        print("[OPT] Attention: default")
     model.eval()
 
-    if HAS_TRITON:
-        apply_triton_optimizations(model)
+    # 探测 Triton
+    _probe_triton()
 
-    # 预热 2 次（触发 CUDA lazy init + Triton JIT）
-    print("[INFO] 预热...")
-    _ids = tokenizer("warmup", return_tensors="pt").to(DEVICE)
+    # 替换层
+    apply_optimizations(model)
+
+    # 预热
+    print("[INFO] 预热推理...")
+    warm_ids = tokenizer("hello world", return_tensors="pt").to(DEVICE)
     with torch.inference_mode():
-        for _ in range(2):
-            model(**_ids, use_cache=True)
+        for _ in range(3):
+            model(**warm_ids, use_cache=True)
     torch.cuda.synchronize(DEVICE)
 
-    n_params = sum(p.numel() for p in model.parameters()) / 1e9
-    print(f"[INFO] 就绪 | {n_params:.1f}B params | VRAM {torch.cuda.memory_allocated(DEVICE)/1e9:.2f} GB")
+    n_p = sum(p.numel() for p in model.parameters()) / 1e9
+    vram = torch.cuda.memory_allocated(DEVICE) / 1e9
+    print(f"[INFO] 就绪 | {n_p:.1f}B params | VRAM {vram:.2f} GB")
     return tokenizer, model
 
 
@@ -213,17 +329,17 @@ def _eos_ids(tokenizer):
     if tokenizer.eos_token_id is not None:
         ids.add(tokenizer.eos_token_id)
     for s in ["<|endoftext|>", "<|im_end|>", "<|end|>"]:
-        t = tokenizer.convert_tokens_to_ids(s)
-        if t is not None and t != getattr(tokenizer, "unk_token_id", -1):
-            ids.add(t)
-    eid = getattr(tokenizer, "eos_token_id", None)
-    if isinstance(eid, (list, tuple)):
-        ids.update(eid)
+        try:
+            t = tokenizer.convert_tokens_to_ids(s)
+            if t is not None and t != getattr(tokenizer, "unk_token_id", -1):
+                ids.add(t)
+        except Exception:
+            pass
     return ids if ids else {tokenizer.eos_token_id or 0}
 
 
 # ============================================================================
-# 核心：批量生成 (Batch Greedy Decode + KV-Cache)
+# 核心：批量贪心生成 + KV-Cache
 # ============================================================================
 
 @torch.inference_mode()
@@ -233,23 +349,17 @@ def batch_generate(
     max_new_tokens: int = MAX_NEW_TOKENS,
 ):
     """
-    批量贪心生成。
-
-    Args:
-        prompts: list[str]，一批 prompt 文本
+    批量贪心 decode + KV-Cache。
 
     Returns:
-        outputs      : list[str]  — 每条 prompt 的生成文本
-        out_lengths  : list[int]  — 每条的输出 token 数
-        ttft_ms      : float      — 首 token 时间 (整个 batch 共享)
-        total_ms     : float      — 端到端时间
+        texts, out_lengths, in_lengths, ttft_ms, total_ms
     """
-    device     = torch.device(DEVICE)
-    pad_id     = tokenizer.pad_token_id or 0
-    eos_ids    = _eos_ids(tokenizer)
-    batch_size = len(prompts)
+    device  = torch.device(DEVICE)
+    pad_id  = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    eos_ids = _eos_ids(tokenizer)
+    B       = len(prompts)
 
-    # ---- tokenize (left-padding) ----
+    # tokenize (left-padding)
     enc = tokenizer(
         prompts,
         return_tensors="pt",
@@ -257,20 +367,23 @@ def batch_generate(
         truncation=True,
         max_length=2048,
     ).to(device)
-    input_ids      = enc["input_ids"]                       # (B, S)
-    attention_mask = enc["attention_mask"]                   # (B, S)
-    input_lengths  = attention_mask.sum(dim=1).tolist()      # 每条的真实输入长度
+    input_ids      = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
+    input_lengths  = attention_mask.sum(dim=1).tolist()
 
-    # ---- 生成状态 ----
-    unfinished     = torch.ones(batch_size, dtype=torch.bool, device=device)
-    generated      = []                                      # list of (B,1)
-    sample_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+    # 状态
+    unfinished     = torch.ones(B, dtype=torch.bool, device=device)
+    generated      = []
+    sample_lengths = torch.zeros(B, dtype=torch.long, device=device)
     past           = None
     cur_ids        = input_ids
     cur_mask       = attention_mask
 
+    # EOS 向量化检测
+    eos_t = torch.tensor(sorted(eos_ids), dtype=torch.long, device=device)
+
     torch.cuda.synchronize(device)
-    t0 = time.perf_counter()
+    t0   = time.perf_counter()
     ttft = None
 
     for step in range(max_new_tokens):
@@ -281,37 +394,32 @@ def batch_generate(
             use_cache=True,
             return_dict=True,
         )
-        logits = out.logits[:, -1, :]          # (B, V)
+        logits = out.logits[:, -1, :]
         past   = out.past_key_values
 
-        next_tok = logits.argmax(dim=-1)       # (B,)
+        next_tok = logits.argmax(dim=-1)      # (B,)
 
-        # TTFT — 仅首步同步计时
         if step == 0:
             torch.cuda.synchronize(device)
             ttft = (time.perf_counter() - t0) * 1000.0
 
-        # 已完成样本填 pad
+        # 已结束 → 填 pad
         next_tok = torch.where(unfinished, next_tok, torch.full_like(next_tok, pad_id))
 
-        # 检查 EOS
-        is_eos = torch.zeros_like(unfinished)
-        for eid in eos_ids:
-            is_eos |= (next_tok == eid)
+        # EOS 检测
+        is_eos = (next_tok.unsqueeze(1) == eos_t.unsqueeze(0)).any(dim=1)
 
-        # 有效 token（未完成 & 非 EOS）计入长度
+        # 有效长度 += 未结束 & 非EOS
         sample_lengths += (unfinished & ~is_eos).long()
         generated.append(next_tok.unsqueeze(1))
 
-        # 更新完成状态
         unfinished = unfinished & ~is_eos
         if not unfinished.any():
             break
 
-        # 准备下一步
         cur_ids  = next_tok.unsqueeze(1)
         cur_mask = torch.cat(
-            [cur_mask, torch.ones(batch_size, 1, device=device, dtype=cur_mask.dtype)],
+            [cur_mask, torch.ones(B, 1, device=device, dtype=cur_mask.dtype)],
             dim=1,
         )
 
@@ -320,23 +428,24 @@ def batch_generate(
     if ttft is None:
         ttft = total_ms
 
-    # ---- 拼接 & decode ----
+    # decode
     if generated:
-        gen_ids = torch.cat(generated, dim=1)              # (B, steps)
+        gen_ids = torch.cat(generated, dim=1)
     else:
-        gen_ids = torch.zeros(batch_size, 0, dtype=torch.long, device=device)
+        gen_ids = torch.zeros(B, 0, dtype=torch.long, device=device)
 
     lengths = sample_lengths.tolist()
     texts   = []
-    for i in range(batch_size):
-        tok_ids = gen_ids[i, :lengths[i]].tolist()
-        texts.append(tokenizer.decode(tok_ids, skip_special_tokens=True))
+    for i in range(B):
+        L = min(max(lengths[i], 0), gen_ids.shape[1])
+        ids_list = gen_ids[i, :L].tolist() if L > 0 else []
+        texts.append(tokenizer.decode(ids_list, skip_special_tokens=True))
 
     return texts, lengths, input_lengths, ttft, total_ms
 
 
 # ============================================================================
-# 高层接口：分 batch 推理全部 prompts
+# 高层接口：按长度排序分 batch 推理
 # ============================================================================
 
 def infer_all(
@@ -346,45 +455,34 @@ def infer_all(
     max_new_tokens: int = MAX_NEW_TOKENS,
     show_progress: bool = True,
 ):
-    """
-    对所有 prompt 做批量推理（按长度排序 → 分 batch → 推理 → 还原顺序）。
-
-    Returns:
-        results: list[dict] — 每条 prompt 一个 dict，包含:
-            prompt, output, input_tokens, output_tokens,
-            total_latency_ms, ttft_ms, throughput_tps
-    """
     n = len(prompts)
     if n == 0:
         return []
 
-    # 1) 按 token 长度排序（减少 padding 浪费）
-    prompt_lens = []
+    # 按长度排序
+    enc_lens = []
     for p in prompts:
-        ids = tokenizer.encode(p, add_special_tokens=False)
-        prompt_lens.append(len(ids))
-    sorted_idx = sorted(range(n), key=lambda i: prompt_lens[i])
+        enc_lens.append(len(tokenizer.encode(p, add_special_tokens=False)))
+    sorted_idx = sorted(range(n), key=lambda i: enc_lens[i])
 
-    # 2) 分 batch
     all_results = [None] * n
     num_batches = math.ceil(n / batch_size)
 
     for b in range(num_batches):
-        start = b * batch_size
-        end   = min(start + batch_size, n)
-        idx_batch     = sorted_idx[start:end]
-        prompt_batch  = [prompts[i] for i in idx_batch]
+        s = b * batch_size
+        e = min(s + batch_size, n)
+        idx_b = sorted_idx[s:e]
+        p_b   = [prompts[i] for i in idx_b]
 
         texts, out_lens, in_lens, ttft, total = batch_generate(
-            model, tokenizer, prompt_batch, max_new_tokens,
+            model, tokenizer, p_b, max_new_tokens,
         )
 
-        bs = len(prompt_batch)
-        for j in range(bs):
-            orig_i = idx_batch[j]
-            tps = out_lens[j] / total * 1000.0 if total > 0 and out_lens[j] > 0 else 0.0
-            all_results[orig_i] = {
-                "prompt":           prompts[orig_i],
+        for j in range(len(p_b)):
+            oi = idx_b[j]
+            tps = (out_lens[j] / total * 1000.0) if (total > 0 and out_lens[j] > 0) else 0.0
+            all_results[oi] = {
+                "prompt":           prompts[oi],
                 "output":           texts[j],
                 "input_tokens":     in_lens[j],
                 "output_tokens":    out_lens[j],
@@ -394,23 +492,17 @@ def infer_all(
             }
 
         if show_progress:
-            done = end
             print(
-                f"  [batch {b+1}/{num_batches}] "
-                f"size={bs}  ttft={ttft:.0f}ms  total={total:.0f}ms  "
-                f"tokens={sum(out_lens)}  ({done}/{n} done)"
+                f"  [batch {b+1}/{num_batches}]  "
+                f"bs={len(p_b)}  ttft={ttft:.0f}ms  total={total:.0f}ms  "
+                f"out_tok={sum(out_lens)}  ({e}/{n} done)"
             )
 
     return all_results
 
 
-# ============================================================================
-# 兼容接口：单条推理
-# ============================================================================
-
 def infer_single(tokenizer, model, prompt: str) -> dict:
-    results = infer_all(tokenizer, model, [prompt], batch_size=1, show_progress=False)
-    return results[0]
+    return infer_all(tokenizer, model, [prompt], batch_size=1, show_progress=False)[0]
 
 
 # ============================================================================
@@ -419,19 +511,18 @@ def infer_single(tokenizer, model, prompt: str) -> dict:
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model_path", type=str, required=True)
-    parser.add_argument("--prompt", type=str, default="请用三句话解释KV Cache的作用。")
-    parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
-    args = parser.parse_args()
+    pa = argparse.ArgumentParser()
+    pa.add_argument("--model_path", type=str, required=True)
+    pa.add_argument("--prompt", type=str, default="请用三句话解释KV Cache的作用。")
+    args = pa.parse_args()
 
-    tokenizer, model = load_model(args.model_path)
-    res = infer_single(tokenizer, model, args.prompt)
+    tok, mdl = load_model(args.model_path)
+    r = infer_single(tok, mdl, args.prompt)
 
     print(f"\n{'='*60}")
-    print(f"  输出: {res['output'][:300]}")
-    print(f"  输入tokens: {res['input_tokens']}  输出tokens: {res['output_tokens']}")
-    print(f"  延迟: {res['total_latency_ms']:.1f}ms  TTFT: {res['ttft_ms']:.1f}ms")
-    print(f"  吞吐: {res['throughput_tps']:.1f} tok/s")
-    print(f"  峰值显存: {torch.cuda.max_memory_allocated(DEVICE)/1e9:.2f} GB")
+    print(f"  输出: {r['output'][:300]}")
+    print(f"  in={r['input_tokens']} out={r['output_tokens']}")
+    print(f"  延迟={r['total_latency_ms']:.1f}ms  TTFT={r['ttft_ms']:.1f}ms")
+    print(f"  吞吐={r['throughput_tps']:.1f} tok/s")
+    print(f"  峰值显存={torch.cuda.max_memory_allocated(DEVICE)/1e9:.2f} GB")
     print(f"{'='*60}")

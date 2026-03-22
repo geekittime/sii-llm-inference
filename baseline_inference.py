@@ -121,7 +121,7 @@ if __name__ == "__main__":
     print(f"  输入 tokens   : {result['input_tokens']}")
     print(f"  输出 tokens   : {result['output_tokens']}")
     print(f"  总延迟         : {result['total_latency_ms']} ms")
-    print(f"  TTFT (近似)   : {result['ttft_approx_ms']} ms/token")
+    print(f"  TTFT (近似)   : {result['ttft_ms']} ms/token")
     print(f"  吞吐率         : {result['throughput_tps']} tokens/sec")
     print(f"  峰值显存       : {torch.cuda.max_memory_allocated() / 1e9:.3f} GB")
     print("=" * 64)
