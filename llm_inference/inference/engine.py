@@ -623,7 +623,7 @@ class InferenceEngine:
                 # [num_kv_heads, rl, head_dim] → [rl, num_kv_heads, head_dim]
                 k_seq = k_full[i, :, -rl:, :].permute(1, 0, 2).contiguous()
                 v_seq = v_full[i, :, -rl:, :].permute(1, 0, 2).contiguous()
-                self.cache.append(i, layer_idx, k_seq, v_seq)
+                self.cache.append(i, layer_idx, k_seq, v_seq, start_pos=0)
 
         logits = outputs.logits[:, -1, :]
 
@@ -731,6 +731,10 @@ class InferenceEngine:
             batch_prompts = [prompts[i] for i in batch_indices]
             bs = len(batch_prompts)
 
+            # 记录batch开始时的blocks使用情况
+            if self.cache_type == "paged":
+                blocks_before = self.cache.allocator.num_free
+
             enc = self.tokenizer(
                 batch_prompts, return_tensors="pt",
                 padding=True, truncation=True, max_length=2048,
@@ -763,6 +767,17 @@ class InferenceEngine:
                     f"  [batch {b+1}/{num_batches}] [{self.cache_type}]  "
                     f"bs={bs}  ttft={ttft:.0f}ms  total={total:.0f}ms  "
                     f"out_tok={sum(out_lens)}  ({end}/{n} done)"
+                )
+
+            # 打印blocks使用情况
+            if self.cache_type == "paged":
+                blocks_after = self.cache.allocator.num_free
+                blocks_used = blocks_before - blocks_after
+                total_blocks = self.cache.pool.num_blocks
+                print(
+                    f"  [batch {b+1}/{num_batches}] blocks_used={blocks_used}  "
+                    f"blocks_free={blocks_after}/{total_blocks}  "
+                    f"blocks_usage_pct={(total_blocks-blocks_after)/total_blocks*100:.1f}%"
                 )
 
         return all_results

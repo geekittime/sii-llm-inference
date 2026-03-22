@@ -177,8 +177,10 @@ cache.append(                         # 写入 KV，自动按 block_size 分片
     seq_id=0, layer_idx=0,
     k=torch.randn(20, 8, 128),        # 20 个 token → block0 写 16 个，block1 写 4 个
     v=torch.randn(20, 8, 128),
+    start_pos=0,                       # prefill 阶段显式指定起始位置，避免跨层 seq_len 干扰
 )
 # 注意：seq_len 只在 layer_idx==0 时更新，避免多层 append 重复计数
+# prefill 时必须传 start_pos=0，否则 layer>0 会从错误位置写入并浪费 block
 
 k_cache, v_cache = cache.get_kv_cache(layer_idx=0)   # 返回整个层的 KVPool Tensor 引用
 
@@ -397,7 +399,7 @@ Decode loop:     model.forward(cur_ids=[1 token], attention_mask, past_key_value
 3. 提取 prefill KV → KVPool:
    for layer in range(num_layers):
        k_full[i, :, -real_len:, :].permute(1,0,2)  # left-padding 对齐：取右侧真实 token
-       cache.append(seq_id, layer, k_seq, v_seq)
+       cache.append(seq_id, layer, k_seq, v_seq, start_pos=0)  # 每层都从位置 0 写入
 
 4. Decode loop:
    adapter.begin_step(unfinished_mask)

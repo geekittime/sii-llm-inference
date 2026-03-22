@@ -170,18 +170,23 @@ class PagedKVCache:
         layer_idx: int,
         k: torch.Tensor,   # [n_tokens, num_kv_heads, head_dim]
         v: torch.Tensor,
+        start_pos: int = None,
     ) -> None:
         """
         追加 KV token 到指定序列的 paged cache。
 
         自动分配新 block (按需)，按 block_size 分片写入 KVPool。
         仅在 layer_idx == 0 时更新 seq_len (避免每层重复计数)。
+
+        Args:
+            start_pos: 显式指定写入起始位置。为 None 时使用 seq_len（适用于 decode 逐 token 追加）。
+                       prefill 阶段应传入 0，避免 layer>0 时 seq_len 已被 layer 0 更新导致写入位置错误。
         """
         n_tokens = k.shape[0]
         if n_tokens == 0:
             return
 
-        current_len = self.block_table.get_seq_len(seq_id)
+        current_len = start_pos if start_pos is not None else self.block_table.get_seq_len(seq_id)
         blocks = self.block_table.get_blocks(seq_id)
 
         written = 0
@@ -237,7 +242,11 @@ class PagedKVCache:
     # ── 重置 ─────────────────────────────────────────────────
 
     def reset(self) -> None:
-        self.allocator.reset()
+        # 先回收所有已分配的 block（避免内存泄漏）
+        for seq_id in list(self.block_table._blocks.keys()):
+            blocks = self.block_table.remove_seq(seq_id)
+            self.allocator.free_many(blocks)
+        # 再 reset block_table（不需要 reset allocator，因为已经回收了所有 block）
         self.block_table.reset()
         # 不清零 pool tensor (下次写入时会覆盖)
 

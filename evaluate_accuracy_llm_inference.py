@@ -284,13 +284,8 @@ def main():
     # 加载评测数据
     eval_data = load_eval_data(args.eval_file)
 
-    # 运行评测
-    if args.cache_type == "paged":
-        # PagedCache 模式使用单条推理
-        result = run_accuracy_eval_single(engine, eval_data)
-    else:
-        # ContinuousCache 模式可以使用批量推理
-        result = run_accuracy_eval_batch(engine, eval_data, args.batch_size)
+    # 运行评测（两种模式都使用批量推理）
+    result = run_accuracy_eval_batch(engine, eval_data, args.batch_size)
 
     # 打印结果
     print_accuracy_result(result, args.baseline_acc)
