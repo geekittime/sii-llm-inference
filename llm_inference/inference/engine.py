@@ -241,7 +241,7 @@ def _make_paged_attn_forward(attn_module, block_size: int, rotary_emb=None):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value=None,
+        past_key_values=None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
@@ -249,12 +249,12 @@ def _make_paged_attn_forward(attn_module, block_size: int, rotary_emb=None):
         **kwargs,
     ):
         # ── Gate: 仅 PagedCacheAdapter 走 paged 路径 ──
-        if not isinstance(past_key_value, PagedCacheAdapter):
+        if not isinstance(past_key_values, PagedCacheAdapter):
             return original_forward(
                 hidden_states,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                past_key_value=past_key_value,
+                past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 use_cache=use_cache,
                 cache_position=cache_position,
@@ -284,7 +284,7 @@ def _make_paged_attn_forward(attn_module, block_size: int, rotary_emb=None):
             query_states, key_states = _apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # ── 写入新 K, V 到 paged cache ──
-        adapter: PagedCacheAdapter = past_key_value
+        adapter: PagedCacheAdapter = past_key_values
         adapter.write_kv(layer_idx, key_states, value_states)
 
         # ── Triton PagedAttention Decode ──
@@ -304,7 +304,7 @@ def _make_paged_attn_forward(attn_module, block_size: int, rotary_emb=None):
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, num_heads * head_dim)
         attn_output = o_proj(attn_output)
 
-        return attn_output, None, past_key_value
+        return attn_output, None, past_key_values
 
     return forward
 
@@ -314,8 +314,8 @@ def _patch_attention_for_paged(model: nn.Module, block_size: int) -> int:
     Monkey-patch 所有 attention 层。
 
     patched forward 的路由逻辑保证:
-      - Prefill (past_key_value=None 或 DynamicCache) → 走原始 HF forward
-      - Decode (past_key_value=PagedCacheAdapter) → 走 Triton PagedAttention
+      - Prefill (past_key_values=None 或 DynamicCache) → 走原始 HF forward
+      - Decode (past_key_values=PagedCacheAdapter) → 走 Triton PagedAttention
     """
     # 尝试从模型中获取 rotary_emb (Qwen2 等模型将其放在模型级别)
     rotary_emb = None
