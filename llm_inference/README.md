@@ -38,8 +38,7 @@ sii-llm-inference/
     │   └── block_table.py          # 页表 (seq_id → block 列表 + seq_len 映射)
     ├── cache/
     │   ├── __init__.py
-    │   ├── base.py                 # KVCache 抽象基类 + CacheHandle 数据类
-    │   ├── continuous_cache.py     # 连续内存 KV-Cache (HF past_key_values 格式)
+    │   ├── continuous_cache.py     # 连续内存 KV-Cache (显存统计占位符)
     │   └── paged_cache.py          # KVPool / PagedKVCache / PagedCacheAdapter
     ├── evaluation/
     │   ├── __init__.py
@@ -53,31 +52,9 @@ sii-llm-inference/
 
 ## 核心实现：Paged Cache & Paged Attention
 
-### 一、KVCache 抽象层 (`cache/base.py`)
+### 一、连续 KV-Cache (`cache/continuous_cache.py`)
 
-所有 KV-Cache 实现均继承自 `KVCache` 抽象基类，统一接口：
-
-```python
-@dataclass
-class CacheHandle:
-    seq_id: int       # 序列唯一标识
-    num_tokens: int   # 已缓存的 token 数
-
-class KVCache(ABC):
-    def allocate(self, seq_id: int, num_tokens: int) -> CacheHandle: ...
-    def get(self, handle: CacheHandle, layer_idx: int) -> Optional[Tuple[Tensor, Tensor]]: ...
-    def append(self, handle: CacheHandle, layer_idx: int, k: Tensor, v: Tensor) -> None: ...
-    def get_memory_usage(self) -> int: ...    # 返回字节数
-    def get_num_cached_tokens(self, handle: CacheHandle) -> int: ...
-    def reset(self) -> None: ...
-    def device(self) -> torch.device: ...    # property
-```
-
----
-
-### 二、连续 KV-Cache (`cache/continuous_cache.py`)
-
-`ContinuousKVCache` 使用 Python dict 存储各序列各层的 KV Tensor，与 HuggingFace `past_key_values` 格式完全兼容。
+`ContinuousKVCache` 是 continuous 模式下的显存统计占位符。引擎实际的 KV 缓存由 HuggingFace `past_key_values` 机制自动管理，`ContinuousKVCache` 仅负责统计已写入的 token 量以供 `get_memory_usage()` 使用。
 
 #### 内部数据结构
 
@@ -86,22 +63,18 @@ _cache: Dict[seq_id, Dict[layer_idx, (K: Tensor, V: Tensor)]]
 # K/V shape: [num_tokens, num_kv_heads, head_dim]
 ```
 
-#### 关键方法
+#### 方法
 
 | 方法 | 说明 |
 |---|---|
-| `allocate(num_tokens) -> int` | 分配新序列 ID，不预分配显存 |
 | `append(seq_id, layer_idx, k, v)` | 追加 KV；首次写入 clone 存储，后续 `torch.cat` 拼接 |
-| `get(seq_id, layer_idx)` | 返回 `(K, V)` 或 `None` |
-| `get_past_key_values(seq_id)` | 返回 HF 格式的 `List[(K, V)]`，缺失层返回空 Tensor |
 | `get_num_cached_tokens(seq_id)` | 读取第 0 层 K 的行数 |
-| `free(seq_id)` | 删除该序列的全部缓存 |
-| `reset()` | 清空所有缓存，seq_id 计数归零 |
+| `reset()` | 清空所有缓存 |
 | `get_memory_usage() -> int` | 估算：`total_tokens × 2 × num_heads × head_dim × element_size` |
 
 ---
 
-### 三、分页 KV-Cache (`cache/paged_cache.py`)
+### 二、分页 KV-Cache (`cache/paged_cache.py`)
 
 分页 Cache 由三个独立组件协作构成：
 
@@ -638,8 +611,6 @@ k_cache, v_cache = cache.get_kv_cache(layer_idx=0)
 
 ```python
 from llm_inference import (
-    # Cache 抽象
-    KVCache, CacheHandle,
     # 连续 Cache
     ContinuousKVCache,
     # 分页 Cache
