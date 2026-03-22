@@ -43,10 +43,11 @@ MAX_NEW_TOKENS = 256
 BATCH_SIZE = 32
 SEED = 42
 
-# KV-Cache 分页参数
+# KV-Cache 分页参数 (自动根据显存调整)
 BLOCK_SIZE = 16
-NUM_BLOCKS = 8192
+NUM_BLOCKS = 1024  # 默认1024，自动根据显存调整
 ENABLE_PREFIX_CACHING = True
+MAX_KV_CACHE_GB = 10  # 最多预分配10GB用于KV缓存
 
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -175,29 +176,62 @@ class PagedKVCache:
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.block_size = block_size
-        self.num_blocks = num_blocks
 
-        # 预分配所有块
-        self.k_cache = torch.zeros(
-            (num_blocks, num_layers, block_size, num_heads, self.head_dim),
-            dtype=self.dtype,
-            device=self.device,
-            requires_grad=False,
-        )
-        self.v_cache = torch.zeros(
-            (num_blocks, num_layers, block_size, num_heads, self.head_dim),
-            dtype=self.dtype,
-            device=self.device,
-            requires_grad=False,
-        )
+        # 计算单个块的显存大小
+        block_elem = block_size * num_heads * self.head_dim
+        bytes_per_elem = 2 if dtype == torch.float16 else 4
+        single_block_size_gb = (block_elem * 2 * bytes_per_elem) / 1e9  # 2 for K and V
+
+        # 根据MAX_KV_CACHE_GB动态计算NUM_BLOCKS
+        max_blocks = int(MAX_KV_CACHE_GB / single_block_size_gb) if single_block_size_gb > 0 else num_blocks
+        self.num_blocks = min(max_blocks, num_blocks)  # 不超过指定的num_blocks
+
+        # 确保至少有足够的块来处理一个batch
+        min_blocks = BATCH_SIZE * ((512 + block_size - 1) // block_size)  # 假设平均512 tokens
+        self.num_blocks = max(self.num_blocks, min_blocks)
+
+        # 预分配块
+        print(f"[PagedKV] 计算块数 | single_block={single_block_size_gb*1e9:.0f}bytes | "
+              f"max_cache={MAX_KV_CACHE_GB}GB | blocks={self.num_blocks}")
+
+        try:
+            self.k_cache = torch.zeros(
+                (self.num_blocks, num_layers, block_size, num_heads, self.head_dim),
+                dtype=self.dtype,
+                device=self.device,
+                requires_grad=False,
+            )
+            self.v_cache = torch.zeros(
+                (self.num_blocks, num_layers, block_size, num_heads, self.head_dim),
+                dtype=self.dtype,
+                device=self.device,
+                requires_grad=False,
+            )
+        except RuntimeError as e:
+            # 如果显存不足，再次减少块数
+            print(f"[WARN] 显存不足，减少块数")
+            self.num_blocks = max(256, self.num_blocks // 2)
+            self.k_cache = torch.zeros(
+                (self.num_blocks, num_layers, block_size, num_heads, self.head_dim),
+                dtype=self.dtype,
+                device=self.device,
+                requires_grad=False,
+            )
+            self.v_cache = torch.zeros(
+                (self.num_blocks, num_layers, block_size, num_heads, self.head_dim),
+                dtype=self.dtype,
+                device=self.device,
+                requires_grad=False,
+            )
 
         # 块分配跟踪
         self.block_table: Dict[int, List[int]] = {}
-        self.free_blocks: List[int] = list(range(num_blocks))
+        self.free_blocks: List[int] = list(range(self.num_blocks))
         self.used_blocks = 0
 
-        print(f"[PagedKV] 初始化 | blocks={num_blocks} | size={block_size} | "
-              f"mem={(num_blocks * block_size * num_heads * self.head_dim * 2 * 2) / 1e9:.1f}GB")
+        total_kv_gb = (self.num_blocks * block_size * num_heads * self.head_dim * 2 * 2) / 1e9
+        print(f"[PagedKV] 初始化 | blocks={self.num_blocks} | size={block_size} | "
+              f"mem={total_kv_gb:.2f}GB")
 
     def allocate_blocks(self, seq_id: int, num_blocks_needed: int) -> List[int]:
         """为序列分配块"""
@@ -594,7 +628,11 @@ if __name__ == "__main__":
     parser.add_argument("--prompt", type=str, default="请用三句话解释KV Cache的作用。")
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--quantize", action="store_true")
+    parser.add_argument("--max_kv_cache_gb", type=int, default=10, help="最大KV缓存显存(GB)")
     args = parser.parse_args()
+
+    # 动态设置MAX_KV_CACHE_GB
+    MAX_KV_CACHE_GB = args.max_kv_cache_gb
 
     tokenizer, model, kv_cache = load_model(args.model_path, quantize=args.quantize)
     res = infer_single(tokenizer, model, args.prompt)

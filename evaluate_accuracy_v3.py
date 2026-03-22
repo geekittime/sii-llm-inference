@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-evaluate_accuracy_v2.py - 改进版
-精度评测脚本（兼容完整PagedAttention版本）
+evaluate_accuracy_v3.py — v3 C-Eval 精度评测
 """
 
 import argparse
@@ -10,9 +9,10 @@ import json
 import time
 from pathlib import Path
 
-from optimized_inference_v2 import load_model, infer_all, BATCH_SIZE
+from optimized_inference_v3 import load_model, infer_all, BATCH_SIZE
 
 DEFAULT_EVAL_FILE = Path(__file__).parent / "ceval_subset.jsonl"
+ACCURACY_DROP_LIMIT = 0.05
 
 
 def load_eval_data(path: str) -> list:
@@ -21,12 +21,8 @@ def load_eval_data(path: str) -> list:
         for line in f:
             line = line.strip()
             if line:
-                try:
-                    import json as j
-                    data.append(j.loads(line))
-                except:
-                    pass
-    print(f"[INFO] 加载 {len(data)} 道题")
+                data.append(json.loads(line))
+    print(f"[INFO] 加载 {len(data)} 道评测题")
     return data
 
 
@@ -49,8 +45,8 @@ def extract_answer(text: str) -> str:
     return "X"
 
 
-def run_accuracy_eval(tokenizer, model, eval_data: list, batch_size: int) -> dict:
-    print(f"\n[Accuracy] 评测 {len(eval_data)} 题，batch_size={batch_size}")
+def run_accuracy_eval(tokenizer, model, kv_cache_pool, eval_data: list, batch_size: int) -> dict:
+    print(f"\n[Accuracy] 批量评测 {len(eval_data)} 题，batch_size={batch_size}")
     print("-" * 60)
 
     prompts = [build_prompt(item) for item in eval_data]
@@ -64,6 +60,7 @@ def run_accuracy_eval(tokenizer, model, eval_data: list, batch_size: int) -> dic
         batch_size=batch_size,
         max_new_tokens=32,
         show_progress=True,
+        kv_cache_pool=kv_cache_pool,
     )
 
     t1 = time.perf_counter()
@@ -96,46 +93,41 @@ def run_accuracy_eval(tokenizer, model, eval_data: list, batch_size: int) -> dic
 
 def print_result(r: dict, baseline: float = None):
     print(f"\n{'='*60}")
-    print(f" 精度评测结果")
+    print(f" 精度评测结果 (v3)")
     print(f"{'='*60}")
-    print(f"  总题数: {r['total']}")
-    print(f"  正确: {r['correct']}")
-    print(f"  错误: {r['wrong']}")
-    print(f"  准确率: {r['accuracy_pct']:.2f}%")
-    print(f"  耗时: {r['eval_time_sec']:.1f} sec")
+    print(f"  总题数:     {r['total']}")
+    print(f"  正确:       {r['correct']}")
+    print(f"  错误:       {r['wrong']}")
+    print(f"  准确率:     {r['accuracy_pct']:.2f}%")
+    print(f"  评测耗时:   {r['eval_time_sec']:.1f} sec")
     if baseline is not None:
         drop = baseline - r["accuracy"]
-        ok = "✓ 达标" if drop <= 0.05 else "✗ 超标"
-        print(f"  基线: {baseline*100:.2f}%")
-        print(f"  精度下降: {drop*100:.2f}% {ok}")
+        ok = "PASS" if drop <= ACCURACY_DROP_LIMIT else "FAIL"
+        print(f"  基线:       {baseline*100:.2f}%")
+        print(f"  精度下降:   {drop*100:.2f}% (上限{ACCURACY_DROP_LIMIT*100:.0f}%) {ok}")
     print(f"{'='*60}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="精度评测 v2")
+    parser = argparse.ArgumentParser(description="C-Eval 精度评测 v3")
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--eval_file", type=str, default=str(DEFAULT_EVAL_FILE))
     parser.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     parser.add_argument("--baseline_acc", type=float, default=None)
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--quantize", action="store_true")
-    parser.add_argument("--max_kv_cache_gb", type=int, default=10, help="最大KV缓存显存(GB)")
     args = parser.parse_args()
 
-    # 动态设置MAX_KV_CACHE_GB
-    import optimized_inference_v2
-    optimized_inference_v2.MAX_KV_CACHE_GB = args.max_kv_cache_gb
-
-    tokenizer, model, kv_cache = load_model(args.model_path, quantize=args.quantize)
+    tokenizer, model, kv_cache_pool = load_model(args.model_path, quantize=args.quantize)
     eval_data = load_eval_data(args.eval_file)
-    result = run_accuracy_eval(tokenizer, model, eval_data, args.batch_size)
+    result = run_accuracy_eval(tokenizer, model, kv_cache_pool, eval_data, args.batch_size)
     print_result(result, args.baseline_acc)
 
     if args.output:
         out = {k: v for k, v in result.items() if k != "wrong_cases"}
         with open(args.output, "w", encoding="utf-8") as f:
             json.dump(out, f, ensure_ascii=False, indent=2)
-        print(f"[INFO] 结果保存到: {args.output}")
+        print(f"[INFO] 结果已保存: {args.output}")
 
 
 if __name__ == "__main__":
