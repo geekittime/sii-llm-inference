@@ -31,6 +31,15 @@ from llm_inference.attention.paged_attention import paged_attention_decode
 
 
 # ============================================================================
+# GPU 显存配置
+# ============================================================================
+
+# 固定 GPU 总显存为 80GB，避免动态读取导致的差异
+_GPU_TOTAL_MEMORY_GB = 80.0
+_GPU_TOTAL_MEMORY_BYTES = int(_GPU_TOTAL_MEMORY_GB * 1e9)
+
+
+# ============================================================================
 # 融合算子 (Triton/PyTorch)
 # ============================================================================
 
@@ -369,16 +378,25 @@ class InferenceEngine:
         model_path: str,
         cache_type: str = "continuous",
         block_size: int = 16,
-        num_blocks: int = 1000,
+        num_blocks: int = 0,
+        gpu_memory_utilization: float = 0.80,
         device: str = "cuda:0",
         dtype: torch.dtype = torch.float16,
         enable_optimizations: bool = True,
         batch_size: int = 32,
     ):
+        """
+        Args:
+            num_blocks: paged 模式下预分配的 block 数。
+                        0 (默认) = 自动计算，根据 gpu_memory_utilization 占满剩余显存。
+                        >0       = 使用固定值。
+            gpu_memory_utilization: 显存利用率上限 (0~1)，仅 num_blocks=0 时生效。
+        """
         self.model_path = model_path
         self.cache_type = cache_type
         self.block_size = block_size
         self.num_blocks = num_blocks
+        self.gpu_memory_utilization = gpu_memory_utilization
         self._device = torch.device(device)
         self.dtype = dtype
         self.enable_optimizations = enable_optimizations
@@ -428,9 +446,6 @@ class InferenceEngine:
         self.num_kv_heads = getattr(self.model.config, "num_key_value_heads", self.num_heads)
         self.head_dim = self.model.config.hidden_size // self.num_heads
 
-        # ── Cache 初始化 ──
-        self._init_cache()
-
         # ── 融合优化 (RMSNorm + SwiGLU) ──
         if self.enable_optimizations:
             _probe_triton(str(self._device))
@@ -441,7 +456,7 @@ class InferenceEngine:
             n = _patch_attention_for_paged(self.model, self.block_size)
             print(f"[OPT] PagedAttention: patched {n} attention layers")
 
-        # ── 预热 ──
+        # ── 预热 (在 Cache 初始化之前，确保显存基线稳定) ──
         print("[INFO] 预热推理...")
         warm_ids = self.tokenizer("hello world", return_tensors="pt").to(self._device)
         with torch.inference_mode():
@@ -449,10 +464,47 @@ class InferenceEngine:
                 self.model(**warm_ids, use_cache=True)
         torch.cuda.synchronize(self._device)
 
+        # ── Cache 初始化 (预热后显存基线已稳定，paged 模式可准确计算可用显存) ──
+        self._init_cache()
+
         n_params = sum(p.numel() for p in self.model.parameters()) / 1e9
         vram = torch.cuda.memory_allocated(self._device) / 1e9
         print(f"[INFO] 就绪 | {n_params:.1f}B params | VRAM {vram:.2f} GB")
         print(f"[INFO] Cache: {self.cache_type}")
+
+    def _compute_num_blocks(self) -> int:
+        """
+        根据 gpu_memory_utilization 自动计算 KVPool 可分配的最大 block 数。
+
+        逻辑 (同 vLLM):
+          available = total_gpu_mem × gpu_memory_utilization − already_allocated
+          num_blocks = available ÷ bytes_per_block
+
+        bytes_per_block = 2 (K+V) × num_layers × block_size × num_kv_heads × head_dim × element_size
+
+        注意：使用固定的 80GB 作为 GPU 总显存，避免动态读取导致的差异。
+        """
+        torch.cuda.synchronize(self._device)
+        total = _GPU_TOTAL_MEMORY_BYTES  # 固定 80GB
+        allocated = torch.cuda.memory_allocated(self._device)
+
+        available = int(total * self.gpu_memory_utilization) - allocated
+        available = max(available, 0)
+
+        element_size = torch.tensor([], dtype=self.dtype).element_size()
+        bytes_per_block = (
+            2 * self.num_layers * self.block_size * self.num_kv_heads * self.head_dim * element_size
+        )
+
+        num_blocks = max(int(available // bytes_per_block), 1)
+        print(
+            f"[Cache] 自动计算 num_blocks={num_blocks} "
+            f"| GPU 总量={_GPU_TOTAL_MEMORY_GB:.1f}GB (固定) "
+            f"| 已分配={allocated/1e9:.2f}GB "
+            f"| 可用于Cache={available/1e9:.2f}GB "
+            f"| 每Block={bytes_per_block/1024:.1f}KB"
+        )
+        return num_blocks
 
     def _init_cache(self):
         if self.cache_type == "continuous":
@@ -464,6 +516,8 @@ class InferenceEngine:
                 dtype=self.dtype,
             )
         elif self.cache_type == "paged":
+            if self.num_blocks <= 0:
+                self.num_blocks = self._compute_num_blocks()
             self.cache = PagedKVCache(
                 num_layers=self.num_layers,
                 num_kv_heads=self.num_kv_heads,
@@ -473,6 +527,8 @@ class InferenceEngine:
                 device=self._device,
                 dtype=self.dtype,
             )
+            cache_mem = self.cache.get_memory_usage()
+            print(f"[Cache] KVPool 已预分配 {cache_mem/1e9:.2f}GB 显存")
         else:
             raise ValueError(f"Unknown cache type: {self.cache_type}")
 

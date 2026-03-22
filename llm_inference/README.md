@@ -338,14 +338,26 @@ def paged_attention_decode(
 
 ```python
 engine = InferenceEngine(
-    model_path: str,                      # 本地模型路径
-    cache_type: str = "continuous",       # "continuous" | "paged"
-    block_size: int = 16,                 # Paged: 每 block 的 token 容量
-    num_blocks: int = 1000,               # Paged: 预分配 block 总数
+    model_path: str,                          # 本地模型路径
+    cache_type: str = "continuous",           # "continuous" | "paged"
+    block_size: int = 16,                     # Paged: 每 block 的 token 容量
+    num_blocks: int = 0,                      # Paged: 预分配 block 总数
+                                              #   0 (默认) = 自动计算，引擎启动时根据
+                                              #   gpu_memory_utilization 占满剩余显存
+                                              #   >0 = 使用固定值，不自动计算
+    gpu_memory_utilization: float = 0.90,    # Paged 自动计算时的 GPU 总显存利用率上限
+                                              #   含义：整卡允许使用的比例上限，
+                                              #   模型权重 + KV Cache 都算在内。
+                                              #   可用于 KVPool 的空间 =
+                                              #     total × gpu_memory_utilization
+                                              #     − 预热后已分配量（含模型权重）
+                                              #   剩余 (1 - gpu_memory_utilization) 作为
+                                              #   forward 中间激活值的安全余量。
+                                              #   仅 num_blocks=0 时生效。
     device: str = "cuda:0",
     dtype: torch.dtype = torch.float16,
-    enable_optimizations: bool = True,    # 是否启用 RMSNorm/SwiGLU 融合
-    batch_size: int = 32,                 # infer_batch 的分批大小
+    enable_optimizations: bool = True,        # 是否启用 RMSNorm/SwiGLU 融合
+    batch_size: int = 32,                     # infer_batch 的分批大小
 )
 ```
 
@@ -511,7 +523,8 @@ python benchmark_llm_inference.py \
 | `--batch_size` | `32` | 推理批量大小 |
 | `--max_new_tokens` | `256` | 最大生成 token 数 |
 | `--block_size` | `16` | Paged Block 大小（仅 paged 有效）|
-| `--num_blocks` | `1000` | Paged Block 总数（仅 paged 有效）|
+| `--num_blocks` | `0` | Paged Block 总数；`0` = 自动计算（仅 paged 有效）|
+| `--gpu_memory_utilization` | `0.90` | GPU 总显存利用率上限，含模型权重；`num_blocks=0` 时生效（仅 paged 有效）|
 | `--output` | `None` | 结果保存路径（JSON）|
 
 输出统计指标：

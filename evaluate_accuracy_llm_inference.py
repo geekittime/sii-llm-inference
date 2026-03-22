@@ -10,11 +10,33 @@ evaluate_accuracy_llm_inference.py
   2. paged: 分页 KV-Cache (PagedAttention)
 
 使用方式：
+  # continuous 模式
   python evaluate_accuracy_llm_inference.py \
-    --model_path /aisi-nas/xiaoquanjia/base_model/Qwen2.5-14B-Instruct \
+    --model_path /path/to/model \
     --cache_type continuous \
     --eval_file ceval_subset.jsonl \
     --batch_size 8
+
+  # paged 模式（自动占满 90% 显存）
+  python evaluate_accuracy_llm_inference.py \
+    --model_path /path/to/model \
+    --cache_type paged \
+    --eval_file ceval_subset.jsonl \
+    --batch_size 64
+
+  # paged 模式（调整显存利用率）
+  python evaluate_accuracy_llm_inference.py \
+    --model_path /path/to/model \
+    --cache_type paged \
+    --gpu_memory_utilization 0.85 \
+    --eval_file ceval_subset.jsonl
+
+  # paged 模式（手动指定 block 数，跳过自动计算）
+  python evaluate_accuracy_llm_inference.py \
+    --model_path /path/to/model \
+    --cache_type paged \
+    --num_blocks 2048 \
+    --eval_file ceval_subset.jsonl
 """
 
 import argparse
@@ -255,11 +277,23 @@ def parse_args():
     )
     parser.add_argument(
         "--block_size", type=int, default=16,
-        help="PagedCache Block 大小（默认：16）"
+        help="PagedCache Block 大小（默认：16，仅 paged 有效）"
     )
     parser.add_argument(
-        "--num_blocks", type=int, default=1000,
-        help="PagedCache Block 数量（默认：1000）"
+        "--num_blocks", type=int, default=0,
+        help=(
+            "PagedCache Block 数量（仅 paged 有效）。"
+            "0（默认）= 自动计算，根据 gpu_memory_utilization 占满剩余显存；"
+            ">0 = 使用固定值"
+        )
+    )
+    parser.add_argument(
+        "--gpu_memory_utilization", type=float, default=0.90,
+        help=(
+            "GPU 总显存利用率上限，含模型权重（默认：0.90，仅 paged + num_blocks=0 时生效）。"
+            "可用于 KVPool 的空间 = total × gpu_memory_utilization − 已分配量。"
+            "剩余比例作为 forward 激活值的安全余量。"
+        )
     )
     parser.add_argument(
         "--output", type=str, default=None,
@@ -278,6 +312,7 @@ def main():
         cache_type=args.cache_type,
         block_size=args.block_size,
         num_blocks=args.num_blocks,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         batch_size=args.batch_size,
     )
 
