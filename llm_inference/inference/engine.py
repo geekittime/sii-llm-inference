@@ -304,7 +304,7 @@ def _make_paged_attn_forward(attn_module, block_size: int, rotary_emb=None):
         attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, num_heads * head_dim)
         attn_output = o_proj(attn_output)
 
-        return attn_output, None, past_key_values
+        return attn_output, None
 
     return forward
 
