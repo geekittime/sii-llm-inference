@@ -627,6 +627,14 @@ class InferenceEngine:
 
         logits = outputs.logits[:, -1, :]
 
+        # ── KVPool 状态确认 ───────────────────────────────────
+        blocks_used = self.cache.pool.num_blocks - self.cache.allocator.num_free
+        print(
+            f"[Paged] prefill KV → KVPool  "
+            f"seqs={B}  seq_lens={[int(r) for r in real_lens]}  "
+            f"blocks_used={blocks_used}/{self.cache.pool.num_blocks}"
+        )
+
         # ── 4. Decode 循环 (PagedAttention) ──────────────────
         adapter = PagedCacheAdapter(self.cache, seq_ids)
         unfinished = torch.ones(B, dtype=torch.bool, device=device)
@@ -649,6 +657,12 @@ class InferenceEngine:
 
             # ── 准备 decode step ──
             cur_ids = next_tok.unsqueeze(1)  # [B, 1]
+
+            if step == 0:
+                print(
+                    f"[Paged] decode step 0: model.forward(past_key_values=PagedCacheAdapter)  "
+                    f"active_seqs={int(unfinished.sum())}"
+                )
 
             adapter.begin_step(unfinished)
 

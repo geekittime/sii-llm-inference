@@ -143,6 +143,9 @@ if _HAS_TRITON:
 
 # ── Python 接口 ─────────────────────────────────────────────────
 
+_KERNEL_LOGGED = False   # 仅首次调用时打印一次算子路径确认
+
+
 def paged_attention_decode(
     query: torch.Tensor,          # [B, num_heads, 1, head_dim]
     k_cache: torch.Tensor,        # [num_blocks, block_size, num_kv_heads, head_dim]
@@ -158,10 +161,18 @@ def paged_attention_decode(
 
     Triton 可用时走 GPU kernel，否则回退到 PyTorch 实现。
     """
+    global _KERNEL_LOGGED
     B, num_heads, _, head_dim = query.shape
     max_num_blocks = block_tables.shape[1]
 
     if _HAS_TRITON and query.is_cuda:
+        if not _KERNEL_LOGGED:
+            print(
+                f"[PagedAttn] backend=Triton kernel  "
+                f"B={B} num_heads={num_heads} block_size={block_size} "
+                f"head_dim={head_dim} max_blocks={max_num_blocks}"
+            )
+            _KERNEL_LOGGED = True
         q = query.squeeze(2).contiguous()   # [B, num_heads, head_dim]
         out = torch.empty_like(q)
 
@@ -182,6 +193,12 @@ def paged_attention_decode(
         return out.unsqueeze(2)  # [B, num_heads, 1, head_dim]
 
     else:
+        if not _KERNEL_LOGGED:
+            print(
+                f"[PagedAttn] backend=PyTorch fallback (Triton unavailable)  "
+                f"B={B} num_heads={num_heads} block_size={block_size} head_dim={head_dim}"
+            )
+            _KERNEL_LOGGED = True
         return _paged_attention_decode_pytorch(
             query, k_cache, v_cache, block_tables, seq_lens,
             scale, num_kv_groups, block_size,
