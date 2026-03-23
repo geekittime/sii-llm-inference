@@ -205,6 +205,149 @@ if _TRITON_IMPORTED:
         )
         return o.reshape(s)
 
+    # ─── Joint Q/K RoPE ───
+    @triton.jit
+    def _rotary_qk_k(Q, K, COS, SIN, QO, KO,
+                     sq, sk, sc, ss, sqo, sko,
+                     N, HALF, BLOCK: tl.constexpr):
+        r = tl.program_id(0)
+        for b in range(0, N, BLOCK):
+            c = b + tl.arange(0, BLOCK)
+            m = c < N
+
+            qv = tl.load(Q + r * sq + c, mask=m, other=0.0).to(tl.float32)
+            kv = tl.load(K + r * sk + c, mask=m, other=0.0).to(tl.float32)
+            cv = tl.load(COS + r * sc + c, mask=m, other=0.0).to(tl.float32)
+            sv = tl.load(SIN + r * ss + c, mask=m, other=0.0).to(tl.float32)
+
+            first_half = c < HALF
+            pair_c = tl.where(first_half, c + HALF, c - HALF)
+
+            q_pair = tl.load(Q + r * sq + pair_c, mask=pair_c < N, other=0.0).to(tl.float32)
+            k_pair = tl.load(K + r * sk + pair_c, mask=pair_c < N, other=0.0).to(tl.float32)
+
+            q_rot = tl.where(first_half, -q_pair, q_pair)
+            k_rot = tl.where(first_half, -k_pair, k_pair)
+
+            tl.store(QO + r * sqo + c, qv * cv + q_rot * sv, mask=m)
+            tl.store(KO + r * sko + c, kv * cv + k_rot * sv, mask=m)
+
+    def triton_apply_rotary_qk(q, k, cos, sin):
+        s = q.shape
+        dim = s[-1]
+        if dim % 2 != 0:
+            raise ValueError(f"RoPE head_dim 必须为偶数，当前为 {dim}")
+
+        q2 = q.reshape(-1, dim).contiguous()
+        k2 = k.reshape(-1, dim).contiguous()
+        cos2 = cos.expand_as(q).reshape(-1, dim).contiguous()
+        sin2 = sin.expand_as(q).reshape(-1, dim).contiguous()
+        qo = torch.empty_like(q2)
+        ko = torch.empty_like(k2)
+        M, N = q2.shape
+        BLK = min(triton.next_power_of_2(N), 4096)
+        _rotary_qk_k[(M,)](
+            q2, k2, cos2, sin2, qo, ko,
+            q2.stride(0), k2.stride(0), cos2.stride(0), sin2.stride(0), qo.stride(0), ko.stride(0),
+            N, N // 2, BLOCK=BLK,
+        )
+        return qo.reshape(s), ko.reshape(s)
+
+    # ─── Residual Add + RMSNorm ───
+    @triton.jit
+    def _add_rms_norm_k(X, R, W, SUM, Y, sx, sr, ss, sy, N, eps, BLOCK: tl.constexpr):
+        row = tl.program_id(0)
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        for b in range(0, N, BLOCK):
+            c = b + tl.arange(0, BLOCK)
+            m = c < N
+            xv = tl.load(X + row * sx + c, mask=m, other=0.0).to(tl.float32)
+            rv = tl.load(R + row * sr + c, mask=m, other=0.0).to(tl.float32)
+            sv = xv + rv
+            acc += sv * sv
+        rstd = 1.0 / tl.sqrt(tl.sum(acc, axis=0) / N + eps)
+        for b in range(0, N, BLOCK):
+            c = b + tl.arange(0, BLOCK)
+            m = c < N
+            xv = tl.load(X + row * sx + c, mask=m, other=0.0).to(tl.float32)
+            rv = tl.load(R + row * sr + c, mask=m, other=0.0).to(tl.float32)
+            sv = xv + rv
+            wv = tl.load(W + c, mask=m, other=1.0).to(tl.float32)
+            tl.store(SUM + row * ss + c, sv, mask=m)
+            tl.store(Y + row * sy + c, sv * rstd * wv, mask=m)
+
+    def triton_add_rms_norm(x, residual, w, eps=1e-6):
+        s = x.shape
+        x2 = x.reshape(-1, s[-1]).contiguous()
+        r2 = residual.reshape(-1, s[-1]).contiguous()
+        sum_out = torch.empty_like(x2)
+        y = torch.empty_like(x2)
+        M, N = x2.shape
+        BLK = min(triton.next_power_of_2(N), 4096)
+        _add_rms_norm_k[(M,)](
+            x2, r2, w, sum_out, y,
+            x2.stride(0), r2.stride(0), sum_out.stride(0), y.stride(0),
+            N, eps, BLOCK=BLK,
+        )
+        return sum_out.reshape(s), y.reshape(s)
+
+    # ─── Token In Set (EOS check) ───
+    @triton.jit
+    def _token_in_set_k(TOKENS, EOS, OUT, N, EOS_N: tl.constexpr, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < N
+        tv = tl.load(TOKENS + offs, mask=mask, other=0)
+        matched = tl.zeros([BLOCK], dtype=tl.int32)
+        for i in range(EOS_N):
+            ev = tl.load(EOS + i)
+            matched += (tv == ev).to(tl.int32)
+        tl.store(OUT + offs, matched > 0, mask=mask)
+
+    def triton_token_in_set(tokens, eos_ids):
+        tokens_1d = tokens.reshape(-1).contiguous()
+        eos_1d = eos_ids.reshape(-1).contiguous()
+        if eos_1d.numel() == 0:
+            return torch.zeros_like(tokens_1d, dtype=torch.bool).reshape(tokens.shape)
+        out = torch.empty(tokens_1d.shape, device=tokens_1d.device, dtype=torch.bool)
+        grid = (triton.cdiv(tokens_1d.numel(), 1024),)
+        _token_in_set_k[grid](tokens_1d, eos_1d, out, tokens_1d.numel(), EOS_N=eos_1d.numel(), BLOCK=1024)
+        return out.reshape(tokens.shape)
+
+    # ─── Apply Unfinished Mask ───
+    @triton.jit
+    def _apply_unfinished_mask_k(TOKENS, MASKS, OUT, PAD, N, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < N
+        tv = tl.load(TOKENS + offs, mask=m, other=0)
+        mv = tl.load(MASKS + offs, mask=m, other=0)
+        tl.store(OUT + offs, tl.where(mv != 0, tv, PAD), mask=m)
+
+    def triton_apply_unfinished_mask(tokens, unfinished, pad_value):
+        tokens_1d = tokens.reshape(-1).contiguous()
+        masks_1d = unfinished.reshape(-1).to(torch.uint8).contiguous()
+        out = torch.empty_like(tokens_1d)
+        grid = (triton.cdiv(tokens_1d.numel(), 1024),)
+        _apply_unfinished_mask_k[grid](tokens_1d, masks_1d, out, pad_value, tokens_1d.numel(), BLOCK=1024)
+        return out.reshape(tokens.shape)
+
+    # ─── Int Add Scalar ───
+    @triton.jit
+    def _add_scalar_k(X, OUT, DELTA, N, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        m = offs < N
+        xv = tl.load(X + offs, mask=m, other=0)
+        tl.store(OUT + offs, xv + DELTA, mask=m)
+
+    def triton_add_scalar(x, delta):
+        x1 = x.reshape(-1).contiguous()
+        out = torch.empty_like(x1)
+        grid = (triton.cdiv(x1.numel(), 1024),)
+        _add_scalar_k[grid](x1, out, delta, x1.numel(), BLOCK=1024)
+        return out.reshape(x.shape)
+
     # ─── Store KV Cache — K 转置存储 ───
     #   K cache: (max_blocks, num_kv_heads, head_dim, block_size)
     #   V cache: (max_blocks, num_kv_heads, block_size, head_dim)
@@ -348,6 +491,21 @@ def pt_silu_mul(g, u):
 def pt_residual_add(x, y):
     return x + y
 
+def pt_add_rms_norm(x, residual, w, eps=1e-6):
+    summed = x + residual
+    return summed, pt_rms_norm(summed, w, eps)
+
+def pt_token_in_set(tokens, eos_ids):
+    if eos_ids.numel() == 0:
+        return torch.zeros_like(tokens, dtype=torch.bool)
+    return (tokens.unsqueeze(-1) == eos_ids.reshape(*([1] * tokens.ndim), -1)).any(dim=-1)
+
+def pt_apply_unfinished_mask(tokens, unfinished, pad_value):
+    return torch.where(unfinished, tokens, torch.full_like(tokens, pad_value))
+
+def pt_add_scalar(x, delta):
+    return x + delta
+
 def fused_rms_norm(x, w, eps=1e-6):
     return triton_rms_norm(x, w, eps) if (HAS_TRITON and x.is_cuda) else pt_rms_norm(x, w, eps)
 
@@ -356,6 +514,18 @@ def fused_silu_mul(g, u):
 
 def fused_residual_add(x, y):
     return triton_residual_add(x, y) if (HAS_TRITON and x.is_cuda and y.is_cuda) else pt_residual_add(x, y)
+
+def fused_add_rms_norm(x, residual, w, eps=1e-6):
+    return triton_add_rms_norm(x, residual, w, eps) if (HAS_TRITON and x.is_cuda and residual.is_cuda) else pt_add_rms_norm(x, residual, w, eps)
+
+def fused_token_in_set(tokens, eos_ids):
+    return triton_token_in_set(tokens, eos_ids) if (HAS_TRITON and tokens.is_cuda and eos_ids.is_cuda) else pt_token_in_set(tokens, eos_ids)
+
+def fused_apply_unfinished_mask(tokens, unfinished, pad_value):
+    return triton_apply_unfinished_mask(tokens, unfinished, pad_value) if (HAS_TRITON and tokens.is_cuda and unfinished.is_cuda) else pt_apply_unfinished_mask(tokens, unfinished, pad_value)
+
+def fused_add_scalar(x, delta):
+    return triton_add_scalar(x, delta) if (HAS_TRITON and x.is_cuda) else pt_add_scalar(x, delta)
 
 
 # ============================================================================
@@ -565,6 +735,8 @@ def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 def fused_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     cos = cos.unsqueeze(unsqueeze_dim)
     sin = sin.unsqueeze(unsqueeze_dim)
+    if HAS_TRITON and q.is_cuda and k.is_cuda and q.shape == k.shape:
+        return triton_apply_rotary_qk(q, k, cos, sin)
     if HAS_TRITON and q.is_cuda and k.is_cuda:
         return (
             triton_apply_rotary_pos_emb(q, cos, sin),
@@ -750,10 +922,14 @@ def paged_decode_step(model, token_ids, position_ids,
 
         attn_out = attn_out.unsqueeze(1).reshape(B, 1, num_q_heads * head_dim)
         attn_out = layer.self_attn.o_proj(attn_out)
-        hidden = fused_residual_add(residual, attn_out)
+        hidden, h = fused_add_rms_norm(
+            attn_out,
+            residual,
+            layer.post_attention_layernorm.weight,
+            getattr(layer.post_attention_layernorm, "variance_epsilon", getattr(layer.post_attention_layernorm, "eps", 1e-6)),
+        )
 
         residual = hidden
-        h = _module_rms_norm(layer.post_attention_layernorm, hidden)
         hidden = fused_residual_add(residual, _module_mlp(layer.mlp, h))
 
     # Step 4: 推进 seq_lens
@@ -852,7 +1028,7 @@ def batch_generate_paged(model, tokenizer, prompts: List[str],
     sample_lengths = torch.zeros(B, dtype=torch.long, device=device)
     cur_tokens     = first_tokens
 
-    is_eos = (cur_tokens.unsqueeze(1) == eos_t.unsqueeze(0)).any(dim=1)
+    is_eos = fused_token_in_set(cur_tokens, eos_t)
     sample_lengths += (unfinished & ~is_eos).long()
     unfinished = unfinished & ~is_eos
 
@@ -879,7 +1055,7 @@ def batch_generate_paged(model, tokenizer, prompts: List[str],
         next_tokens = torch.full_like(cur_tokens, pad_id)
         next_tokens.index_copy_(0, active_idx, active_logits.argmax(dim=-1))
 
-        is_eos = (next_tokens.unsqueeze(1) == eos_t.unsqueeze(0)).any(dim=1)
+        is_eos = fused_token_in_set(next_tokens, eos_t)
         sample_lengths += (unfinished & ~is_eos).long()
         generated.append(next_tokens.unsqueeze(1))
 
@@ -1007,7 +1183,7 @@ def batch_generate_paged_dynamic(
                 input_len = int(batch_input_lens[local_idx])
                 input_lengths[request_idx] = input_len
 
-                is_eos = first_token in eos_ids
+                is_eos = bool(fused_token_in_set(first_tokens[local_idx:local_idx + 1], eos_t)[0].item())
                 sample_len = 0 if is_eos else 1
                 generated_ids = [first_token]
 
@@ -1067,6 +1243,8 @@ def batch_generate_paged_dynamic(
         )
 
         next_tokens = logits.argmax(dim=-1)
+        next_positions = fused_add_scalar(positions, 1)
+        eos_mask = fused_token_in_set(next_tokens, eos_t)
         finished_slots: List[int] = []
 
         for local_idx, slot_id in enumerate(active_slot_ids):
@@ -1074,12 +1252,12 @@ def batch_generate_paged_dynamic(
             next_token = int(next_tokens[local_idx].item())
             state.generated_ids.append(next_token)
 
-            is_eos = next_token in eos_ids
+            is_eos = bool(eos_mask[local_idx].item())
             if not is_eos:
                 state.sample_len += 1
 
             state.current_token = next_token
-            state.position += 1
+            state.position = int(next_positions[local_idx].item())
 
             if is_eos or state.sample_len >= max_new_tokens:
                 texts[state.request_idx] = tokenizer.decode(
@@ -1143,9 +1321,8 @@ def batch_generate_standard(model, tokenizer, prompts,
         if step == 0:
             torch.cuda.synchronize(device)
             ttft = (time.perf_counter() - t0) * 1000.0
-        next_tok = torch.where(unfinished, next_tok,
-                               torch.full_like(next_tok, pad_id))
-        is_eos = (next_tok.unsqueeze(1) == eos_t.unsqueeze(0)).any(dim=1)
+        next_tok = fused_apply_unfinished_mask(next_tok, unfinished, pad_id)
+        is_eos = fused_token_in_set(next_tok, eos_t)
         sample_lengths += (unfinished & ~is_eos).long()
         generated.append(next_tok.unsqueeze(1))
         unfinished = unfinished & ~is_eos
@@ -1236,7 +1413,7 @@ def apply_optimizations(model):
     tag = "Triton" if HAS_TRITON else "PyTorch"
     print(f"[OPT] {tag} 融合 RMSNorm×{nr}, SwiGLU×{nm}")
     print(
-        f"[OPT] Decode kernels: {'RMSNorm, SwiGLU, ResidualAdd, RoPE, KVCache, PagedAttention' if HAS_TRITON else 'PyTorch fallback'}"
+        f"[OPT] Decode kernels: {'RMSNorm, SwiGLU, ResidualAdd, AddRMSNorm, RoPE, RoPE-QK, TokenInSet, UnfinishedMask, AddScalar, KVCache, PagedAttention' if HAS_TRITON else 'PyTorch fallback'}"
     )
 
 
