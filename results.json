@@ -1,8 +1,8 @@
 {
   "total": 1251,
-  "correct": 306,
-  "wrong": 945,
-  "accuracy": 0.2446,
-  "accuracy_pct": 24.46,
-  "eval_time_sec": 70.77
+  "correct": 971,
+  "wrong": 280,
+  "accuracy": 0.7762,
+  "accuracy_pct": 77.62,
+  "eval_time_sec": 19.8
 }
