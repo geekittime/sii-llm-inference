@@ -1,24 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-optimized_inference.py
-======================
-Qwen2.5-14B-Instruct 高性能推理引擎 (v3 — 修复版)
-
-修复要点:
-  1. Prefill 使用 HF 原生 SDPA (保证正确性) → 拷贝 KV 到 paged cache
-  2. KV Cache 保持工业级布局: K^T=(blocks, heads, dim, block_size), V=(blocks, heads, block_size, dim)
-  3. Decode 使用向量化 Triton paged attention (online softmax)
-  4. 修复 Triton 内核中 max_num_blocks 非 constexpr 的问题
-  5. 修复 store_kvcache 和 decode kernel 的所有 stride/offset 计算
-
-核心优化:
-  - PagedAttention — 按需分配物理 block, 零碎片
-  - Triton 融合算子 — store_kvcache / paged_attention_decode / RMSNorm / SwiGLU
-  - KV Cache 转置布局 — attention 计算时 K^T 和 V 均为连续内存
-  - 自适应 Batch Size / 按长度排序分组
-"""
-
 import os, sys, time, math, sysconfig
 from typing import List, Dict, Set, Optional
 from collections import deque
@@ -34,10 +13,13 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 # ============================================================================
 DEVICE          = "cuda:0"
 DTYPE           = torch.float16
-MAX_NEW_TOKENS  = 256
+MAX_NEW_TOKENS  = 1024
 BATCH_SIZE      = 32
 SEED            = 42
 PAGE_BLOCK_SIZE = 16
+DYNAMIC_REFILL_RATIO = 0.25
+DYNAMIC_MIN_ADMIT = 4
+DYNAMIC_PROGRESS_INTERVAL = 128
 
 
 @dataclass
@@ -160,6 +142,67 @@ if _TRITON_IMPORTED:
         M, N = g2.shape; o = torch.empty_like(g2)
         BLK = min(triton.next_power_of_2(N), 4096)
         _silu_mul_k[(M,)](g2, u2, o, g2.stride(0), u2.stride(0), o.stride(0), N, BLOCK=BLK)
+        return o.reshape(s)
+
+    # ─── Residual Add ───
+    @triton.jit
+    def _residual_add_k(X, Y, O, sx, sy, so, N, BLOCK: tl.constexpr):
+        r = tl.program_id(0)
+        for b in range(0, N, BLOCK):
+            c = b + tl.arange(0, BLOCK)
+            m = c < N
+            xv = tl.load(X + r * sx + c, mask=m, other=0.0).to(tl.float32)
+            yv = tl.load(Y + r * sy + c, mask=m, other=0.0).to(tl.float32)
+            tl.store(O + r * so + c, xv + yv, mask=m)
+
+    def triton_residual_add(x, y):
+        s = x.shape
+        x2 = x.reshape(-1, s[-1]).contiguous()
+        y2 = y.reshape(-1, s[-1]).contiguous()
+        M, N = x2.shape
+        o = torch.empty_like(x2)
+        BLK = min(triton.next_power_of_2(N), 4096)
+        _residual_add_k[(M,)](x2, y2, o, x2.stride(0), y2.stride(0), o.stride(0), N, BLOCK=BLK)
+        return o.reshape(s)
+
+    # ─── Rotary Position Embedding ───
+    @triton.jit
+    def _rotary_pos_emb_k(X, COS, SIN, O,
+                          sx, sc, ss, so,
+                          N, HALF, BLOCK: tl.constexpr):
+        r = tl.program_id(0)
+        for b in range(0, N, BLOCK):
+            c = b + tl.arange(0, BLOCK)
+            m = c < N
+
+            xv = tl.load(X + r * sx + c, mask=m, other=0.0).to(tl.float32)
+            cv = tl.load(COS + r * sc + c, mask=m, other=0.0).to(tl.float32)
+            sv = tl.load(SIN + r * ss + c, mask=m, other=0.0).to(tl.float32)
+
+            first_half = c < HALF
+            pair_c = tl.where(first_half, c + HALF, c - HALF)
+            pair_v = tl.load(X + r * sx + pair_c, mask=pair_c < N, other=0.0).to(tl.float32)
+            rot_v = tl.where(first_half, -pair_v, pair_v)
+
+            tl.store(O + r * so + c, xv * cv + rot_v * sv, mask=m)
+
+    def triton_apply_rotary_pos_emb(x, cos, sin):
+        s = x.shape
+        dim = s[-1]
+        if dim % 2 != 0:
+            raise ValueError(f"RoPE head_dim 必须为偶数，当前为 {dim}")
+
+        x2 = x.reshape(-1, dim).contiguous()
+        cos2 = cos.expand_as(x).reshape(-1, dim).contiguous()
+        sin2 = sin.expand_as(x).reshape(-1, dim).contiguous()
+        M, N = x2.shape
+        o = torch.empty_like(x2)
+        BLK = min(triton.next_power_of_2(N), 4096)
+        _rotary_pos_emb_k[(M,)](
+            x2, cos2, sin2, o,
+            x2.stride(0), cos2.stride(0), sin2.stride(0), o.stride(0),
+            N, N // 2, BLOCK=BLK,
+        )
         return o.reshape(s)
 
     # ─── Store KV Cache — K 转置存储 ───
@@ -302,11 +345,17 @@ def pt_rms_norm(x, w, eps=1e-6):
 def pt_silu_mul(g, u):
     return F.silu(g) * u
 
+def pt_residual_add(x, y):
+    return x + y
+
 def fused_rms_norm(x, w, eps=1e-6):
     return triton_rms_norm(x, w, eps) if (HAS_TRITON and x.is_cuda) else pt_rms_norm(x, w, eps)
 
 def fused_silu_mul(g, u):
     return triton_silu_mul(g, u) if (HAS_TRITON and g.is_cuda) else pt_silu_mul(g, u)
+
+def fused_residual_add(x, y):
+    return triton_residual_add(x, y) if (HAS_TRITON and x.is_cuda and y.is_cuda) else pt_residual_add(x, y)
 
 
 # ============================================================================
@@ -513,6 +562,27 @@ def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
             k * cos + _rotate_half(k) * sin)
 
 
+def fused_apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    if HAS_TRITON and q.is_cuda and k.is_cuda:
+        return (
+            triton_apply_rotary_pos_emb(q, cos, sin),
+            triton_apply_rotary_pos_emb(k, cos, sin),
+        )
+    return (q * cos + _rotate_half(q) * sin,
+            k * cos + _rotate_half(k) * sin)
+
+
+def _module_rms_norm(mod, x):
+    eps = getattr(mod, "variance_epsilon", getattr(mod, "eps", 1e-6))
+    return fused_rms_norm(x, mod.weight, eps)
+
+
+def _module_mlp(mod, x):
+    return mod.down_proj(fused_silu_mul(mod.gate_proj(x), mod.up_proj(x)))
+
+
 # ============================================================================
 # Prefill KV → Paged Cache 拷贝 (适配 K^T 布局)
 # ============================================================================
@@ -644,7 +714,7 @@ def paged_decode_step(model, token_ids, position_ids,
     # Step 3: 逐层 Transformer
     for layer_idx, layer in enumerate(model.model.layers):
         residual = hidden
-        h = layer.input_layernorm(hidden)
+        h = _module_rms_norm(layer.input_layernorm, hidden)
 
         q = layer.self_attn.q_proj(h)
         k = layer.self_attn.k_proj(h)
@@ -656,7 +726,7 @@ def paged_decode_step(model, token_ids, position_ids,
 
         # RoPE
         cos, sin = model.model.rotary_emb(q, position_ids)
-        q, k = _apply_rotary_pos_emb(q, k, cos, sin)
+        q, k = fused_apply_rotary_pos_emb(q, k, cos, sin)
 
         # Store KV (RoPE'd K + raw V)
         # k: (B, nkvh, 1, hd) → squeeze → (B, nkvh, hd)
@@ -680,18 +750,18 @@ def paged_decode_step(model, token_ids, position_ids,
 
         attn_out = attn_out.unsqueeze(1).reshape(B, 1, num_q_heads * head_dim)
         attn_out = layer.self_attn.o_proj(attn_out)
-        hidden = residual + attn_out
+        hidden = fused_residual_add(residual, attn_out)
 
         residual = hidden
-        h = layer.post_attention_layernorm(hidden)
-        hidden = residual + layer.mlp(h)
+        h = _module_rms_norm(layer.post_attention_layernorm, hidden)
+        hidden = fused_residual_add(residual, _module_mlp(layer.mlp, h))
 
     # Step 4: 推进 seq_lens
     for sid in seq_ids:
         paged_cache.increment_seq_len(sid)
 
     # Step 5: Final norm + LM head
-    hidden = model.model.norm(hidden)
+    hidden = _module_rms_norm(model.model.norm, hidden)
     return model.lm_head(hidden[:, -1, :])
 
 
@@ -869,6 +939,10 @@ def batch_generate_paged_dynamic(
     prompt_lens = [len(tokenizer.encode(prompt, add_special_tokens=False)) for prompt in prompts]
     max_prompt_len = max(prompt_lens) if prompt_lens else 1
     max_concurrent = max(1, min(max_batch_size, total_requests))
+    refill_threshold = min(
+        max_concurrent,
+        max(DYNAMIC_MIN_ADMIT, int(math.ceil(max_concurrent * DYNAMIC_REFILL_RATIO))),
+    )
 
     max_total_tokens = max_prompt_len + max_new_tokens + 8
     max_blocks_per_seq = math.ceil(max_total_tokens / PAGE_BLOCK_SIZE) + 2
@@ -888,6 +962,7 @@ def batch_generate_paged_dynamic(
     active: Dict[int, RequestState] = {}
     completed = 0
     next_request = 0
+    last_reported_completed = 0
 
     texts = [""] * total_requests
     lengths = [0] * total_requests
@@ -898,7 +973,16 @@ def batch_generate_paged_dynamic(
     ttft: Optional[float] = None
 
     while completed < total_requests:
-        if free_slots and next_request < total_requests:
+        should_admit = (
+            free_slots
+            and next_request < total_requests
+            and (
+                not active
+                or len(free_slots) >= refill_threshold
+                or next_request + len(free_slots) >= total_requests
+            )
+        )
+        if should_admit:
             admit_count = min(len(free_slots), total_requests - next_request)
             slot_ids = [free_slots.popleft() for _ in range(admit_count)]
             prompt_batch = prompts[next_request : next_request + admit_count]
@@ -949,11 +1033,12 @@ def batch_generate_paged_dynamic(
 
             next_request += admit_count
 
-            if show_progress:
+            if show_progress and (completed - last_reported_completed >= DYNAMIC_PROGRESS_INTERVAL or completed == total_requests):
                 print(
                     f"  [dynamic admit] admitted={admit_count} active={len(active)} "
                     f"completed={completed}/{total_requests} pending={total_requests-next_request}"
                 )
+                last_reported_completed = completed
 
         if not active:
             continue
@@ -1010,11 +1095,15 @@ def batch_generate_paged_dynamic(
         for slot_id in finished_slots:
             del active[slot_id]
 
-        if show_progress and finished_slots:
+        if show_progress and (
+            completed - last_reported_completed >= DYNAMIC_PROGRESS_INTERVAL
+            or completed == total_requests
+        ):
             print(
                 f"  [dynamic step] finished={len(finished_slots)} active={len(active)} "
                 f"completed={completed}/{total_requests} pending={total_requests-next_request}"
             )
+            last_reported_completed = completed
 
     torch.cuda.synchronize(device)
     total_ms = (time.perf_counter() - t0) * 1000.0
@@ -1146,6 +1235,9 @@ def apply_optimizations(model):
             m.forward = _make_mlp_fwd(m); nm += 1
     tag = "Triton" if HAS_TRITON else "PyTorch"
     print(f"[OPT] {tag} 融合 RMSNorm×{nr}, SwiGLU×{nm}")
+    print(
+        f"[OPT] Decode kernels: {'RMSNorm, SwiGLU, ResidualAdd, RoPE, KVCache, PagedAttention' if HAS_TRITON else 'PyTorch fallback'}"
+    )
 
 
 # ============================================================================
