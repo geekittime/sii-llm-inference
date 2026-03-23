@@ -17,9 +17,6 @@ MAX_NEW_TOKENS  = 1024
 BATCH_SIZE      = 32
 SEED            = 42
 PAGE_BLOCK_SIZE = 16
-DYNAMIC_REFILL_RATIO = 0.25
-DYNAMIC_MIN_ADMIT = 4
-DYNAMIC_PROGRESS_INTERVAL = 128
 
 
 @dataclass
@@ -1115,10 +1112,6 @@ def batch_generate_paged_dynamic(
     prompt_lens = [len(tokenizer.encode(prompt, add_special_tokens=False)) for prompt in prompts]
     max_prompt_len = max(prompt_lens) if prompt_lens else 1
     max_concurrent = max(1, min(max_batch_size, total_requests))
-    refill_threshold = min(
-        max_concurrent,
-        max(DYNAMIC_MIN_ADMIT, int(math.ceil(max_concurrent * DYNAMIC_REFILL_RATIO))),
-    )
 
     max_total_tokens = max_prompt_len + max_new_tokens + 8
     max_blocks_per_seq = math.ceil(max_total_tokens / PAGE_BLOCK_SIZE) + 2
@@ -1138,7 +1131,6 @@ def batch_generate_paged_dynamic(
     active: Dict[int, RequestState] = {}
     completed = 0
     next_request = 0
-    last_reported_completed = 0
 
     texts = [""] * total_requests
     lengths = [0] * total_requests
@@ -1149,16 +1141,7 @@ def batch_generate_paged_dynamic(
     ttft: Optional[float] = None
 
     while completed < total_requests:
-        should_admit = (
-            free_slots
-            and next_request < total_requests
-            and (
-                not active
-                or len(free_slots) >= refill_threshold
-                or next_request + len(free_slots) >= total_requests
-            )
-        )
-        if should_admit:
+        if free_slots and next_request < total_requests:
             admit_count = min(len(free_slots), total_requests - next_request)
             slot_ids = [free_slots.popleft() for _ in range(admit_count)]
             prompt_batch = prompts[next_request : next_request + admit_count]
@@ -1183,7 +1166,7 @@ def batch_generate_paged_dynamic(
                 input_len = int(batch_input_lens[local_idx])
                 input_lengths[request_idx] = input_len
 
-                is_eos = bool(fused_token_in_set(first_tokens[local_idx:local_idx + 1], eos_t)[0].item())
+                is_eos = first_token in eos_ids
                 sample_len = 0 if is_eos else 1
                 generated_ids = [first_token]
 
@@ -1209,12 +1192,11 @@ def batch_generate_paged_dynamic(
 
             next_request += admit_count
 
-            if show_progress and (completed - last_reported_completed >= DYNAMIC_PROGRESS_INTERVAL or completed == total_requests):
+            if show_progress:
                 print(
                     f"  [dynamic admit] admitted={admit_count} active={len(active)} "
                     f"completed={completed}/{total_requests} pending={total_requests-next_request}"
                 )
-                last_reported_completed = completed
 
         if not active:
             continue
@@ -1243,8 +1225,6 @@ def batch_generate_paged_dynamic(
         )
 
         next_tokens = logits.argmax(dim=-1)
-        next_positions = fused_add_scalar(positions, 1)
-        eos_mask = fused_token_in_set(next_tokens, eos_t)
         finished_slots: List[int] = []
 
         for local_idx, slot_id in enumerate(active_slot_ids):
@@ -1252,12 +1232,12 @@ def batch_generate_paged_dynamic(
             next_token = int(next_tokens[local_idx].item())
             state.generated_ids.append(next_token)
 
-            is_eos = bool(eos_mask[local_idx].item())
+            is_eos = next_token in eos_ids
             if not is_eos:
                 state.sample_len += 1
 
             state.current_token = next_token
-            state.position = int(next_positions[local_idx].item())
+            state.position += 1
 
             if is_eos or state.sample_len >= max_new_tokens:
                 texts[state.request_idx] = tokenizer.decode(
@@ -1273,15 +1253,11 @@ def batch_generate_paged_dynamic(
         for slot_id in finished_slots:
             del active[slot_id]
 
-        if show_progress and (
-            completed - last_reported_completed >= DYNAMIC_PROGRESS_INTERVAL
-            or completed == total_requests
-        ):
+        if show_progress and finished_slots:
             print(
                 f"  [dynamic step] finished={len(finished_slots)} active={len(active)} "
                 f"completed={completed}/{total_requests} pending={total_requests-next_request}"
             )
-            last_reported_completed = completed
 
     torch.cuda.synchronize(device)
     total_ms = (time.perf_counter() - t0) * 1000.0
