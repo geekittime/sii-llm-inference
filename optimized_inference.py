@@ -1533,16 +1533,16 @@ if __name__ == "__main__":
     pa.add_argument("--model_path", type=str, required=True)
     pa.add_argument("--prompt", type=str,
                     default="请用三句话解释 KV Cache 的作用。")
-    pa.add_argument("--batch_size", type=int, default=-1)
+    pa.add_argument("--batch_size", type=int, default=256)
     pa.add_argument("--max_new_tokens", type=int, default=MAX_NEW_TOKENS)
     pa.add_argument("--no_paged", action="store_true")
     pa.add_argument("--no_dynamic_batch", action="store_true")
     args = pa.parse_args()
 
     tok, mdl = load_model(args.model_path)
-    if args.batch_size <= 0:
-        args.batch_size = _auto_batch_size(mdl, tok)
-        print(f"[INFO] auto batch_size = {args.batch_size}")
+    # if args.batch_size <= 0:
+    #     args.batch_size = _auto_batch_size(mdl, tok)
+    #     print(f"[INFO] auto batch_size = {args.batch_size}")
 
     r = infer_single(
         tok,
