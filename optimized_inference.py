@@ -20,8 +20,9 @@ Qwen2.5-14B-Instruct 高性能推理引擎 (v3 — 修复版)
 """
 
 import os, sys, time, math, sysconfig
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 from collections import deque
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
@@ -37,6 +38,17 @@ MAX_NEW_TOKENS  = 256
 BATCH_SIZE      = 32
 SEED            = 42
 PAGE_BLOCK_SIZE = 16
+
+
+@dataclass
+class RequestState:
+    request_idx: int
+    slot_id: int
+    input_len: int
+    position: int
+    current_token: int
+    sample_len: int
+    generated_ids: List[int]
 
 torch.manual_seed(SEED)
 if torch.cuda.is_available():
@@ -73,7 +85,7 @@ _ensure_python_headers()
 # ============================================================================
 # Triton 导入 & 探测
 # ============================================================================
-_ = False
+_TRITON_IMPORTED = False
 HAS_TRITON = False
 try:
     import triton
@@ -505,7 +517,8 @@ def _apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 # Prefill KV → Paged Cache 拷贝 (适配 K^T 布局)
 # ============================================================================
 def _copy_prefill_kv_to_paged(hf_past, paged_cache: PagedKVCache,
-                               input_lengths: List[int], padded_len: int):
+                               input_lengths: List[int], padded_len: int,
+                               seq_ids: Optional[List[int]] = None):
     """
     将 HF past_key_values 拷贝到 PagedKVCache (K^T 布局)。
     HF KV: (B, num_kv_heads, seq_len, head_dim)
@@ -515,6 +528,8 @@ def _copy_prefill_kv_to_paged(hf_past, paged_cache: PagedKVCache,
     B = len(input_lengths)
     device = paged_cache.device
     block_size = paged_cache.block_size
+    if seq_ids is None:
+        seq_ids = list(range(B))
 
     for layer_idx in range(paged_cache.num_layers):
         K_layer = hf_past[layer_idx][0]   # (B, nkvh, padded_len, hd)
@@ -531,7 +546,7 @@ def _copy_prefill_kv_to_paged(hf_past, paged_cache: PagedKVCache,
             all_k.append(k_actual.permute(1, 0, 2).contiguous())
             all_v.append(v_actual.permute(1, 0, 2).contiguous())
 
-            pt = paged_cache.page_tables[i]
+            pt = paged_cache.page_tables[seq_ids[i]]
             for j in range(actual_len):
                 blk_idx = j // block_size
                 offset  = j % block_size
@@ -548,7 +563,52 @@ def _copy_prefill_kv_to_paged(hf_past, paged_cache: PagedKVCache,
                       slots, block_size)
 
     for i in range(B):
-        paged_cache.seq_lens[i] = input_lengths[i]
+        paged_cache.seq_lens[seq_ids[i]] = input_lengths[i]
+
+
+@torch.inference_mode()
+def _prefill_prompts_to_slots(
+    model,
+    tokenizer,
+    prompts: List[str],
+    slot_ids: List[int],
+    paged_cache: PagedKVCache,
+):
+    device = torch.device(DEVICE)
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=2048,
+    ).to(device)
+
+    input_ids = enc["input_ids"]
+    attention_mask = enc["attention_mask"]
+    input_lengths = attention_mask.sum(dim=1).tolist()
+    padded_len = input_ids.shape[1]
+
+    for slot_id, input_len in zip(slot_ids, input_lengths):
+        paged_cache.allocate_seq(slot_id, input_len)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=True,
+        return_dict=True,
+    )
+
+    _copy_prefill_kv_to_paged(
+        outputs.past_key_values,
+        paged_cache,
+        input_lengths,
+        padded_len,
+        seq_ids=slot_ids,
+    )
+
+    first_logits = outputs.logits[:, -1, :].clone()
+    del outputs
+    return first_logits, input_lengths
 
 
 # ============================================================================
@@ -775,6 +835,195 @@ def batch_generate_paged(model, tokenizer, prompts: List[str],
     return texts, lengths, input_lengths, ttft, total_ms
 
 
+@torch.inference_mode()
+def batch_generate_paged_dynamic(
+    model,
+    tokenizer,
+    prompts: List[str],
+    max_batch_size: int = BATCH_SIZE,
+    max_new_tokens: int = MAX_NEW_TOKENS,
+    show_progress: bool = False,
+):
+    """
+    动态 batch 调度:
+      1. 维护固定数量的活跃 slot
+      2. slot 空出后立即将等待队列中的请求 prefill 入场
+      3. decode 每步仅处理活跃请求
+      4. 序列完成后立即回收 paged cache block
+    """
+    device = torch.device(DEVICE)
+    pad_id = tokenizer.pad_token_id or 0
+    eos_ids = _eos_ids(tokenizer)
+    eos_t = torch.tensor(sorted(eos_ids), dtype=torch.long, device=device)
+    total_requests = len(prompts)
+
+    if total_requests == 0:
+        return [], [], [], 0.0, 0.0
+
+    cfg = model.config
+    num_layers = cfg.num_hidden_layers
+    num_q_heads = cfg.num_attention_heads
+    num_kv_heads = getattr(cfg, "num_key_value_heads", num_q_heads)
+    head_dim = cfg.hidden_size // num_q_heads
+
+    prompt_lens = [len(tokenizer.encode(prompt, add_special_tokens=False)) for prompt in prompts]
+    max_prompt_len = max(prompt_lens) if prompt_lens else 1
+    max_concurrent = max(1, min(max_batch_size, total_requests))
+
+    max_total_tokens = max_prompt_len + max_new_tokens + 8
+    max_blocks_per_seq = math.ceil(max_total_tokens / PAGE_BLOCK_SIZE) + 2
+    total_max_blocks = max_blocks_per_seq * max_concurrent + 64
+
+    paged_cache = PagedKVCache(
+        num_layers=num_layers,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        block_size=PAGE_BLOCK_SIZE,
+        max_blocks=total_max_blocks,
+        device=device,
+        dtype=DTYPE,
+    )
+
+    free_slots: deque = deque(range(max_concurrent))
+    active: Dict[int, RequestState] = {}
+    completed = 0
+    next_request = 0
+
+    texts = [""] * total_requests
+    lengths = [0] * total_requests
+    input_lengths = [0] * total_requests
+
+    torch.cuda.synchronize(device)
+    t0 = time.perf_counter()
+    ttft: Optional[float] = None
+
+    while completed < total_requests:
+        if free_slots and next_request < total_requests:
+            admit_count = min(len(free_slots), total_requests - next_request)
+            slot_ids = [free_slots.popleft() for _ in range(admit_count)]
+            prompt_batch = prompts[next_request : next_request + admit_count]
+
+            first_logits, batch_input_lens = _prefill_prompts_to_slots(
+                model,
+                tokenizer,
+                prompt_batch,
+                slot_ids,
+                paged_cache,
+            )
+
+            if ttft is None:
+                torch.cuda.synchronize(device)
+                ttft = (time.perf_counter() - t0) * 1000.0
+
+            first_tokens = first_logits.argmax(dim=-1)
+
+            for local_idx, slot_id in enumerate(slot_ids):
+                request_idx = next_request + local_idx
+                first_token = int(first_tokens[local_idx].item())
+                input_len = int(batch_input_lens[local_idx])
+                input_lengths[request_idx] = input_len
+
+                is_eos = first_token in eos_ids
+                sample_len = 0 if is_eos else 1
+                generated_ids = [first_token]
+
+                if is_eos or sample_len >= max_new_tokens:
+                    texts[request_idx] = tokenizer.decode(
+                        generated_ids[:sample_len],
+                        skip_special_tokens=True,
+                    ) if sample_len > 0 else ""
+                    lengths[request_idx] = sample_len
+                    paged_cache.free_seq(slot_id)
+                    free_slots.append(slot_id)
+                    completed += 1
+                else:
+                    active[slot_id] = RequestState(
+                        request_idx=request_idx,
+                        slot_id=slot_id,
+                        input_len=input_len,
+                        position=input_len,
+                        current_token=first_token,
+                        sample_len=sample_len,
+                        generated_ids=generated_ids,
+                    )
+
+            next_request += admit_count
+
+            if show_progress:
+                print(
+                    f"  [dynamic admit] admitted={admit_count} active={len(active)} "
+                    f"completed={completed}/{total_requests} pending={total_requests-next_request}"
+                )
+
+        if not active:
+            continue
+
+        active_slot_ids = sorted(active.keys())
+        cur_tokens = torch.tensor(
+            [active[slot_id].current_token for slot_id in active_slot_ids],
+            dtype=torch.long,
+            device=device,
+        )
+        positions = torch.tensor(
+            [active[slot_id].position for slot_id in active_slot_ids],
+            dtype=torch.long,
+            device=device,
+        )
+
+        logits = paged_decode_step(
+            model,
+            cur_tokens.unsqueeze(1),
+            positions.unsqueeze(1),
+            paged_cache,
+            active_slot_ids,
+            num_q_heads,
+            num_kv_heads,
+            head_dim,
+        )
+
+        next_tokens = logits.argmax(dim=-1)
+        finished_slots: List[int] = []
+
+        for local_idx, slot_id in enumerate(active_slot_ids):
+            state = active[slot_id]
+            next_token = int(next_tokens[local_idx].item())
+            state.generated_ids.append(next_token)
+
+            is_eos = next_token in eos_ids
+            if not is_eos:
+                state.sample_len += 1
+
+            state.current_token = next_token
+            state.position += 1
+
+            if is_eos or state.sample_len >= max_new_tokens:
+                texts[state.request_idx] = tokenizer.decode(
+                    state.generated_ids[:state.sample_len],
+                    skip_special_tokens=True,
+                ) if state.sample_len > 0 else ""
+                lengths[state.request_idx] = state.sample_len
+                paged_cache.free_seq(slot_id)
+                free_slots.append(slot_id)
+                finished_slots.append(slot_id)
+                completed += 1
+
+        for slot_id in finished_slots:
+            del active[slot_id]
+
+        if show_progress and finished_slots:
+            print(
+                f"  [dynamic step] finished={len(finished_slots)} active={len(active)} "
+                f"completed={completed}/{total_requests} pending={total_requests-next_request}"
+            )
+
+    torch.cuda.synchronize(device)
+    total_ms = (time.perf_counter() - t0) * 1000.0
+    if ttft is None:
+        ttft = total_ms
+
+    return texts, lengths, input_lengths, ttft, total_ms
+
+
 # ============================================================================
 # 标准批量生成 (backup)
 # ============================================================================
@@ -951,13 +1200,40 @@ def infer_all(tokenizer, model, prompts: list,
               batch_size: int = BATCH_SIZE,
               max_new_tokens: int = MAX_NEW_TOKENS,
               show_progress: bool = True,
-              use_paged: bool = True):
+              use_paged: bool = True,
+              use_dynamic_batch: bool = True):
     n = len(prompts)
     if n == 0:
         return []
 
     enc_lens   = [len(tokenizer.encode(p, add_special_tokens=False)) for p in prompts]
     sorted_idx = sorted(range(n), key=lambda i: enc_lens[i])
+
+    if use_paged and use_dynamic_batch:
+        sorted_prompts = [prompts[i] for i in sorted_idx]
+        texts, out_lens, in_lens, ttft, total = batch_generate_paged_dynamic(
+            model,
+            tokenizer,
+            sorted_prompts,
+            max_batch_size=batch_size,
+            max_new_tokens=max_new_tokens,
+            show_progress=show_progress,
+        )
+
+        all_results = [None] * n
+        for j in range(n):
+            original_idx = sorted_idx[j]
+            tps = (out_lens[j] / total * 1000.0) if (total > 0 and out_lens[j] > 0) else 0.0
+            all_results[original_idx] = {
+                "prompt": prompts[original_idx],
+                "output": texts[j],
+                "input_tokens": in_lens[j],
+                "output_tokens": out_lens[j],
+                "total_latency_ms": round(total, 2),
+                "ttft_ms": round(ttft, 2),
+                "throughput_tps": round(tps, 2),
+            }
+        return all_results
 
     all_results = [None] * n
     num_batches = math.ceil(n / batch_size)
@@ -995,10 +1271,12 @@ def infer_all(tokenizer, model, prompts: list,
 
 
 def infer_single(tokenizer, model, prompt: str,
-                 use_paged: bool = True) -> dict:
+                 use_paged: bool = True,
+                 use_dynamic_batch: bool = True) -> dict:
     return infer_all(tokenizer, model, [prompt],
                      batch_size=1, show_progress=False,
-                     use_paged=use_paged)[0]
+                     use_paged=use_paged,
+                     use_dynamic_batch=use_dynamic_batch)[0]
 
 
 # ============================================================================
@@ -1013,6 +1291,7 @@ if __name__ == "__main__":
     pa.add_argument("--batch_size", type=int, default=-1)
     pa.add_argument("--max_new_tokens", type=int, default=MAX_NEW_TOKENS)
     pa.add_argument("--no_paged", action="store_true")
+    pa.add_argument("--no_dynamic_batch", action="store_true")
     args = pa.parse_args()
 
     tok, mdl = load_model(args.model_path)
@@ -1020,7 +1299,13 @@ if __name__ == "__main__":
         args.batch_size = _auto_batch_size(mdl, tok)
         print(f"[INFO] auto batch_size = {args.batch_size}")
 
-    r = infer_single(tok, mdl, args.prompt, use_paged=not args.no_paged)
+    r = infer_single(
+        tok,
+        mdl,
+        args.prompt,
+        use_paged=not args.no_paged,
+        use_dynamic_batch=not args.no_dynamic_batch,
+    )
     print(f"\n{'='*60}")
     print(f"输出: {r['output'][:300]}")
     print(f"in={r['input_tokens']}  out={r['output_tokens']}")
